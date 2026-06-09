@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Hermes / memory-wiki runtime data
+memory-wiki/
+**/memory_wiki.sqlite3
+**/memory_wiki.sqlite3-*
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.env
+.env*
+!.env.example
+vault/
+secrets/
+secret-vault/
+backups/
+snapshots/
+pages/
+dashboards/
+spool/
+sessions/
+logs/
+*.log
+*.bak
+*.backup
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Smoke-test temporary homes if created inside repo
+memorywiki_smoke_*/
