@@ -152,7 +152,7 @@ Environment variables:
 ```bash
 export MEMORY_WIKI_LLM_PACK=1
 export MEMORY_WIKI_LLM_BASE_URL=http://127.0.0.1:18646/v1
-export MEMORY_WIKI_LLM_API_KEY=noop
+export MEMORY_WIKI_LLM_API_KEY=example-api-key
 export MEMORY_WIKI_LLM_MODEL=local-model
 export MEMORY_WIKI_LLM_TIMEOUT=45
 ```
