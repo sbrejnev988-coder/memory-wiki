@@ -1,4 +1,4 @@
-"""memory-wiki v1.1.1: native Hermes active-memory wiki vault.
+"""memory-wiki v1.2.0: native Hermes active-memory wiki vault.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki. Runs inside MemoryProvider lifecycle, so recall is
@@ -63,9 +63,9 @@ MAX_RENDER_TOPICS = 250
 MIN_AUTO_INGEST_SCORE = 2
 MIN_EXPLICIT_INGEST_SCORE = 1
 CANONICAL_TOPICS = {
-    "preferences", "hermes", "memory-wiki", "server", "android", "proxy", "api", "telegram",
+    "preferences", "hermes", "memory-wiki", "server", "android", "agent-runtime", "proxy", "api", "telegram",
     "config", "database", "github", "project-scoping", "secrets", "projects", "tasks", "lessons", "decisions",
-    "operations", "bridge", "smoke", "general",
+    "operations", "bridge", "trading", "product", "smoke", "general",
 }
 FORBIDDEN_AUTO_TOPICS = {
     "curl", "post", "get", "put", "patch", "delete", "noop", "test", "tests", "тест", "возвращает",
@@ -102,7 +102,7 @@ SECRET_PATTERNS = [
     # `key=value` assignments.  Redact those before any recall/export.
     (re.compile(r"(?is)((?:password|passwd|pass|пароль)[\s\S]{0,240}?```(?:text|bash|sh)?\s*)((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(\s*```)") , r"\1<PASSWORD_REDACTED>\3"),
     (re.compile(r"(?i)\b(password|passwd|pass|пароль)\s+(?!(?:auth(?:entication)?|disabled|enabled|login|logins|mode|modes|field|fields|value|values|manager|protected|vault|entry|entries|ssh|path|policy|required|only|is|are|was|were|есть|нет|доступ|аутентификация)\b)([A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <PASSWORD_REDACTED>"),
-    (re.compile(r"(?i)\b(root|admin|user)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
+    (re.compile(r"(?i)\b(root|admin|administrator|service|user)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
     (re.compile(r"\b(?:sk|rk|pk|ak)-[A-Za-z0-9_\-]{16,}\b"), "<API_KEY_REDACTED>"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "<GITHUB_TOKEN_REDACTED>"),
     (re.compile(r"\bglpat-[A-Za-z0-9_\-]{16,}\b"), "<GITLAB_TOKEN_REDACTED>"),
@@ -121,6 +121,21 @@ SECRET_ASSIGN_RE = re.compile(r"(?i)\b(password|passwd|пароль|token|ток
 REDaction_MARKER_RE = re.compile(r"<[^>]*(?:REDACTED|redacted)[^>]*>|\*{3,}|•••", re.I)
 REDACTION_TOKEN_RE = re.compile(r"<[^>]*(?:REDACTED|redacted)[^>]*>", re.I)
 MEMORY_CLASS_WEIGHTS = {"secret": 1.0, "credential_index": 0.95, "tool_log": 0.30, "raw_blob": 0.22, "preference": 0.82, "procedure": 0.78, "environment": 0.74, "decision": 0.80, "lesson": 0.78, "fact": 0.64}
+SOURCE_POLICY = {
+    # Пишем только то, что имеет шанс быть долговечным. Остальное — в review queue/карантин.
+    "explicit": {"default_confidence": 0.95, "candidate_only": False, "allow_preferences": True, "allow_raw": False},
+    "conversation": {"default_confidence": 0.62, "candidate_only": True, "allow_preferences": True, "allow_raw": False},
+    "conversation_summary": {"default_confidence": 0.55, "candidate_only": True, "allow_preferences": False, "allow_raw": False},
+    "tool": {"default_confidence": 0.74, "candidate_only": False, "allow_preferences": False, "allow_raw": False},
+    "config_metadata": {"default_confidence": 0.90, "candidate_only": False, "allow_preferences": False, "allow_raw": False},
+    "import": {"default_confidence": 0.58, "candidate_only": True, "allow_preferences": False, "allow_raw": False},
+    "curated": {"default_confidence": 0.92, "candidate_only": False, "allow_preferences": True, "allow_raw": False},
+    "unknown": {"default_confidence": 0.50, "candidate_only": True, "allow_preferences": False, "allow_raw": False},
+}
+CURATED_SOURCES = {
+    "post_task", "project_profile", "decision", "mistake", "task_capsule",
+    "memory_wiki_compress_topic", "memory_wiki_compile_topic", "memory_wiki_import_bundle",
+}
 STOP = {
     "the","and","for","with","that","this","from","have","will","you","your","are","was","were","but","not","как","что","это","для","или","при","если","где","уже","под","над","без","его","она","они","оно"
 }
@@ -267,7 +282,7 @@ def secret_scan(text: str) -> Dict[str, Any]:
     for pat, repl in SECRET_PATTERNS:
         for m in pat.finditer(raw):
             findings.append({"kind": repl.strip("<>").lower(), "span": [m.start(), m.end()], "sample": short(redact_secrets(m.group(0)), 80)})
-    marker_spans = [m.span() for m in re.finditer(r"\[REDACTED_SECRET:[^\]]+\]", raw, re.I)]
+    marker_spans = [m.span() for m in re.finditer(r"\[REDACTED_SECRET(?::[^\]]+)?\]", raw, re.I)]
     for m in SECRET_ASSIGN_RE.finditer(raw):
         if any(m.start() >= a and m.end() <= b for a, b in marker_spans):
             continue
@@ -318,6 +333,17 @@ def _env_value_state(name: str, value: str) -> str:
         return "set/redacted"
     return "set"
 
+def source_policy_for(source: str) -> Dict[str, Any]:
+    """Stable source-ingestion policy used by write firewall and provenance cards."""
+    src = str(source or "").strip()
+    st = infer_source_type(src)
+    if src.startswith("phase6_curated_summary") or src in CURATED_SOURCES or src.startswith("memory_wiki_"):
+        st = "curated"
+    policy = dict(SOURCE_POLICY.get(st, SOURCE_POLICY["unknown"]))
+    policy["source"] = src
+    policy["source_type"] = st
+    return policy
+
 def normalize_claim(text: str) -> str:
     s = redact_secrets(str(text or ""))
     s = re.sub(r"\s+", " ", s).strip(" -•\t\r\n")
@@ -336,7 +362,7 @@ def is_ephemeral_fragment(text: str) -> bool:
     if not s:
         return True
     low = s.lower()
-    if re.match(r"(?i)^(memory-wiki quality policy|secrets memory summary|server environment summary|telegram summary|proxy/api summary|hermes operational memory summary|user workflow preferences summary|topic summary for )", s):
+    if re.match(r"(?i)^(memory-wiki quality policy|secrets memory summary|server environment summary|telegram summary|proxy/api summary|openclaw summary|hermes operational memory summary|user workflow preferences summary|topic summary for )", s):
         return False
     if low.startswith(("tool results were processed", "[hermes proxy]", "{", "system note:", "previous turn was interrupted")):
         return True
@@ -362,8 +388,9 @@ def memory_gate_decision(text: str, topic: str = "", source: str = "") -> Dict[s
     lint = lint_claim_text(s, topic)
     low = f"{s} {topic} {source}".lower()
     source_s = str(source or "")
+    policy = source_policy_for(source_s)
     explicit = source_s.startswith("memory_tool") or source_s in ("tool", "explicit_user_correction")
-    curated = source_s.startswith("phase6_curated_summary") or source_s in ("post_task", "project_profile", "decision", "mistake")
+    curated = source_s.startswith("phase6_curated_summary") or source_s in CURATED_SOURCES or policy.get("source_type") == "curated"
     durable_hint = any(k in low for k in (
         "user prefers", "пользователь предпочитает", "preference", "procedure", "runbook", "decision",
         "verified", "проверено", "installed", "установ", "service", "systemd", "config", "endpoint",
@@ -379,11 +406,13 @@ def memory_gate_decision(text: str, topic: str = "", source: str = "") -> Dict[s
         if source_s == "task_capsule" or curated:
             return {"action":"queue", "reason":"structured data should be summarized before claim storage", "lint":lint}
         return {"action":"reject", "reason":"raw blob/log; summarize first", "lint":lint}
+    if policy.get("candidate_only") and not (explicit or curated or durable_hint):
+        return {"action":"queue", "reason":"source policy requires review", "lint":lint, "policy":policy}
     if lint["quality"] < 0.34 or (lint["issues"] and not durable_hint and not curated):
-        return {"action":"queue", "reason":"low quality or ambiguous durability", "lint":lint}
+        return {"action":"queue", "reason":"low quality or ambiguous durability", "lint":lint, "policy":policy}
     if lint["quality"] < 0.48 and not (explicit or durable_hint or curated):
         return {"action":"queue", "reason":"borderline quality", "lint":lint}
-    return {"action":"accept", "reason":"accepted", "lint":lint}
+    return {"action":"accept", "reason":"accepted", "lint":lint, "policy":policy}
 
 def infer_source_type(source: str) -> str:
     src = str(source or "").lower()
@@ -429,6 +458,7 @@ def canonical_topic(topic: str, claim: str = "") -> str:
         return "memory-wiki"
     if "memory-wiki" in low_claim or "memory_wiki" in low_claim or "memory wiki" in low_claim:
         return "memory-wiki"
+    if "openclaw" in low: return "openclaw"
     if "telegram" in low or "bot token" in low: return "telegram"
     if "android" in low or "termux" in low or "proot" in low: return "android"
     if "sqlite" in low or "database" in low: return "database"
@@ -440,7 +470,7 @@ def infer_scope(text: str, source: str = "", topic: str = "") -> str:
     low = f"{text} {source} {topic}".lower()
     if source.startswith("turn:") or source in ("pre_compress",):
         if any(x in low for x in ("сейчас", "temporary", "this session", "текущ", "лог", "команду")): return "session"
-    if any(x in low for x in ("project", "workspace", "repo", "/workspace/", "memory-wiki", "проект")): return "project"
+    if any(x in low for x in ("project", "workspace", "repo", "/workspace/", "openclaw", "memory-wiki", "проект")): return "project"
     if any(x in low for x in ("android", "termux", "proot", "server", "vps", "path", "installed", "порт", "port")): return "device"
     if any(x in low for x in ("user prefers", "пользователь предпочитает", "не надо", "do not", "never", "нравится")): return "user"
     return "global"
@@ -697,6 +727,15 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_resolve_by_policy","description":"Resolve contradiction using policy: prefer_explicit_user, prefer_recent, prefer_verified, prefer_environment_probe.","parameters":P({"contradiction_id":{"type":"string"},"policy":{"type":"string","default":"prefer_explicit_user"}}, ["contradiction_id"])},
             {"name":"memory_wiki_repair","description":"Run targeted self-healing repairs: fts, dashboards, integrity, or all.","parameters":P({"target":{"type":"string","enum":["fts","dashboards","integrity","all"],"default":"all"},"dry_run":{"type":"boolean","default":True}})},
             {"name":"memory_wiki_audit_log","description":"Show recent memory-wiki write/repair/backup/restore audit events.","parameters":P({"limit":{"type":"integer","default":50}})},
+            {"name":"memory_wiki_write_firewall","description":"Dry-run or queue a candidate memory through source policy, quality lint, artifact detection and secret firewall before durable write.","parameters":P({"claim":{"type":"string"},"topic":{"type":"string","default":"general"},"evidence":{"type":"string","default":""},"source":{"type":"string","default":"tool"},"mode":{"type":"string","enum":["check","queue","apply"],"default":"check"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7}}, ["claim"])},
+            {"name":"memory_wiki_mutation_log","description":"Return transactional mutation log entries with before/after metadata for undo/audit.","parameters":P({"limit":{"type":"integer","default":50},"target_table":{"type":"string","default":""},"target_id":{"type":"string","default":""},"since_seconds":{"type":"integer","default":0}}, [])},
+            {"name":"memory_wiki_undo_last","description":"Undo the last reversible memory mutation or a specific mutation id.","parameters":P({"mutation_id":{"type":"string","default":""},"dry_run":{"type":"boolean","default":True}}, [])},
+            {"name":"memory_wiki_transaction","description":"Dry-run/apply a bounded batch of memory operations with optional pre-apply backup and rollback ids.","parameters":P({"operations":{"type":"array","items":{"type":"object"}},"mode":{"type":"string","enum":["suggest","apply","apply_with_backup"],"default":"suggest"},"reason":{"type":"string","default":""}}, ["operations"])},
+            {"name":"memory_wiki_compile_topic","description":"Compile micro-claims in a topic into a curated structured summary; suggest or apply with superseding of older low-priority claims.","parameters":P({"topic":{"type":"string"},"mode":{"type":"string","enum":["suggest","apply"],"default":"suggest"},"limit":{"type":"integer","default":50},"summary_type":{"type":"string","enum":["summary","runbook","profile","timeline","decision"],"default":"summary"}}, ["topic"])},
+            {"name":"memory_wiki_get_project_context","description":"Return first-class project profile plus related claims/task capsules/graph context.","parameters":P({"project_id":{"type":"string"},"query":{"type":"string","default":""},"limit":{"type":"integer","default":20}}, ["project_id"])},
+            {"name":"memory_wiki_source_policy","description":"Show ingestion policy and write-firewall decision for a source/candidate.","parameters":P({"source":{"type":"string","default":"tool"},"claim":{"type":"string","default":""},"topic":{"type":"string","default":"general"}}, [])},
+            {"name":"memory_wiki_export_bundle","description":"Export a redacted scoped sync bundle for cross-profile/remote memory-wiki import.","parameters":P({"topic":{"type":"string","default":""},"project_id":{"type":"string","default":""},"scope":{"type":"string","default":""},"limit":{"type":"integer","default":500},"write_file":{"type":"boolean","default":True}}, [])},
+            {"name":"memory_wiki_import_bundle","description":"Import a redacted memory-wiki sync bundle from payload or local path.","parameters":P({"payload":{"type":"object"},"path":{"type":"string","default":""},"mode":{"type":"string","enum":["suggest","upsert"],"default":"suggest"}}, [])},
             {"name":"memory_wiki_export","description":"Export bounded claims/evidence/contradictions JSON.","parameters":P({"limit":{"type":"integer","default":200}})},
         ]
 
@@ -765,6 +804,15 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_resolve_by_policy": return tool_result(success=True, **self._resolve_by_policy(a.get("contradiction_id") or "", a.get("policy") or "prefer_explicit_user"))
             if tool_name == "memory_wiki_repair": return tool_result(success=True, **self._repair(a.get("target") or "all", bool(a.get("dry_run", True))))
             if tool_name == "memory_wiki_audit_log": return tool_result(success=True, events=self._audit_log(int(a.get("limit",50))))
+            if tool_name == "memory_wiki_write_firewall": return tool_result(success=True, **self._write_firewall(a))
+            if tool_name == "memory_wiki_mutation_log": return tool_result(success=True, **self._mutation_log(int(a.get("limit",50)), a.get("target_table") or "", a.get("target_id") or "", int(a.get("since_seconds",0) or 0)))
+            if tool_name == "memory_wiki_undo_last": return tool_result(success=True, **self._undo_last(a.get("mutation_id") or "", bool(a.get("dry_run", True))))
+            if tool_name == "memory_wiki_transaction": return tool_result(success=True, **self._transaction(a.get("operations") or [], a.get("mode") or "suggest", a.get("reason") or ""))
+            if tool_name == "memory_wiki_compile_topic": return tool_result(success=True, **self._compile_topic(a.get("topic") or "general", a.get("mode") or "suggest", int(a.get("limit",50)), a.get("summary_type") or "summary"))
+            if tool_name == "memory_wiki_get_project_context": return tool_result(success=True, **self._get_project_context(a.get("project_id") or "", a.get("query") or "", int(a.get("limit",20))))
+            if tool_name == "memory_wiki_source_policy": return tool_result(success=True, **self._source_policy_tool(a.get("source") or "tool", a.get("claim") or "", a.get("topic") or "general"))
+            if tool_name == "memory_wiki_export_bundle": return tool_result(success=True, **self._export_bundle(a))
+            if tool_name == "memory_wiki_import_bundle": return tool_result(success=True, **self._import_bundle(a))
             if tool_name == "memory_wiki_export": return tool_result(self._export(int(a.get("limit",200))))
             return tool_error(f"unknown memory-wiki tool: {tool_name}")
         except sqlite3.OperationalError as e:
@@ -786,6 +834,23 @@ class MemoryWikiProvider(MemoryProvider):
                 except Exception:
                     pass
             return tool_error(msg)
+        except sqlite3.DatabaseError as e:
+            msg = str(e)
+            if not _retry_after_reconnect:
+                try:
+                    if self._conn is not None:
+                        self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                retry_args = dict(a)
+                retry_args["__retry_after_reconnect"] = True
+                return self.handle_tool_call(tool_name, retry_args, **kwargs)
+            try:
+                self._preserve_db_files("database_error")
+            except Exception:
+                pass
+            return tool_error(f"{msg}; provider connection/database error after reconnect. Run direct quick_check and restart Hermes/plugin runtime if the DB is valid.")
         except Exception as e:
             return tool_error(str(e))
 
@@ -902,6 +967,20 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("""CREATE TABLE IF NOT EXISTS memory_changes(
                 id TEXT PRIMARY KEY, action TEXT NOT NULL, claim_id TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_memory_changes_created ON memory_changes(created_at)")
+            c.execute("""CREATE TABLE IF NOT EXISTS memory_mutations(
+                id TEXT PRIMARY KEY, batch_id TEXT NOT NULL DEFAULT '', actor TEXT NOT NULL DEFAULT 'memory-wiki', operation TEXT NOT NULL,
+                target_table TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL DEFAULT '', before_json TEXT NOT NULL DEFAULT '', after_json TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '', reversible INTEGER NOT NULL DEFAULT 1, undone_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_memory_mutations_target ON memory_mutations(target_table,target_id,created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_memory_mutations_batch ON memory_mutations(batch_id,created_at)")
+            c.execute("""CREATE TABLE IF NOT EXISTS source_policies(
+                source_type TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at INTEGER NOT NULL)""")
+            for st, pol in sorted(SOURCE_POLICY.items()):
+                c.execute("INSERT OR REPLACE INTO source_policies(source_type,policy_json,updated_at) VALUES(?,?,?)", (st, json.dumps(pol, ensure_ascii=False, sort_keys=True), now()))
+            c.execute("""CREATE TABLE IF NOT EXISTS sync_bundles(
+                id TEXT PRIMARY KEY, path TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', payload_hash TEXT NOT NULL DEFAULT '',
+                direction TEXT NOT NULL DEFAULT 'export', created_at INTEGER NOT NULL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sync_bundles_created ON sync_bundles(created_at)")
             c.execute("""CREATE TABLE IF NOT EXISTS audit_log(id TEXT PRIMARY KEY, op TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)")
             c.execute("""CREATE TABLE IF NOT EXISTS recall_events(
@@ -922,7 +1001,7 @@ class MemoryWikiProvider(MemoryProvider):
                 ('eval_memory_quality','правила качества memory-wiki',['memory-wiki','hermes'],[],['raw logs','structured claims'],['Traceback','[TOOL]']),
                 ('eval_hermes_plugin','как патчить Hermes plugin',['hermes','memory-wiki'],[],['py_compile','smoke'],['full output:','stdout']),
                 ('eval_secrets','как хранить секреты',['secrets'],[],['secret_index','redacted'],['password=','token=']),
-                ('eval_preferences','how project preferences should be recalled',['preferences'],[],['preference','procedure'],['raw import','Traceback']),
+                ('eval_preferences','что пользователь предпочитает в ответах',['preferences'],[],['русском','конкретику'],['Imported TencentDB','Traceback']),
                 ('eval_android','как работать с Android/proot Hermes',['android','hermes'],[],['Android','proot'],['raw preview','[TOOL]']),
             ]
             for eid,q,mt,mnt,mi,mni in default_cases:
@@ -949,10 +1028,15 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("""CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, decision TEXT NOT NULL, rationale TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT 'decisions', alternatives TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'tool', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
             c.execute("""CREATE TABLE IF NOT EXISTS mistakes(id TEXT PRIMARY KEY, trigger TEXT NOT NULL, mistake TEXT NOT NULL, fix TEXT NOT NULL DEFAULT '', prevention TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT 'lessons', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
             c.execute("""CREATE TABLE IF NOT EXISTS project_profiles(project_id TEXT PRIMARY KEY, root TEXT NOT NULL DEFAULT '', purpose TEXT NOT NULL DEFAULT '', commands TEXT NOT NULL DEFAULT '[]', services TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL)""")
+            for col, typ, default in [("stack_json","TEXT","'{}'"),("current_status","TEXT","''"),("last_verified_at","INTEGER","0"),("scope","TEXT","'project'"),("source","TEXT","'project_profile'")]:
+                if col not in self._cols("project_profiles"):
+                    c.execute(f"ALTER TABLE project_profiles ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}")
             c.execute("""CREATE TABLE IF NOT EXISTS task_capsules(id TEXT PRIMARY KEY, intent TEXT NOT NULL, topic TEXT NOT NULL DEFAULT 'tasks', plan TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '[]', commands TEXT NOT NULL DEFAULT '[]', errors TEXT NOT NULL DEFAULT '[]', fixes TEXT NOT NULL DEFAULT '[]', verification TEXT NOT NULL DEFAULT '', followups TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
             c.execute("""CREATE TABLE IF NOT EXISTS entities(id TEXT PRIMARY KEY, name TEXT NOT NULL, entity_type TEXT NOT NULL DEFAULT 'thing', aliases TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
             c.execute("""CREATE TABLE IF NOT EXISTS relations(id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL, confidence REAL NOT NULL DEFAULT .8, evidence TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject,predicate)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_relations_object ON relations(object,predicate)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name, entity_type)")
             try:
                 c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS claims_fts USING fts5(id UNINDEXED, claim, normalized, topic, evidence, search_text, tokenize='unicode61')")
                 cols = self._cols("claims_fts")
@@ -978,6 +1062,112 @@ class MemoryWikiProvider(MemoryProvider):
             c=self._connect(); ts=now(); aid="aud_"+sha(f"{op}:{status}:{detail}:{ts}")[:14]
             with c: c.execute("INSERT OR IGNORE INTO audit_log(id,op,status,detail,created_at) VALUES(?,?,?,?,?)", (aid, short(op,120), short(status,40), short(redact_secrets(detail),1600), ts))
         except Exception: pass
+
+    def _record_mutation(self, operation: str, target_table: str = "", target_id: str = "", before: Any = None, after: Any = None, reason: str = "", batch_id: str = "", reversible: bool = True) -> str:
+        """Append-only mutation ledger. Values are redacted before storage; raw secrets never enter the ledger."""
+        ts = now()
+        before_json = redact_secrets(json.dumps(before or {}, ensure_ascii=False, sort_keys=True, default=str))
+        after_json = redact_secrets(json.dumps(after or {}, ensure_ascii=False, sort_keys=True, default=str))
+        mid = "mut_" + sha(f"{operation}:{target_table}:{target_id}:{before_json}:{after_json}:{ts}")[:14]
+        with self._connect() as c:
+            c.execute(
+                """INSERT OR IGNORE INTO memory_mutations(id,batch_id,actor,operation,target_table,target_id,before_json,after_json,reason,reversible,undone_at,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (mid, short(batch_id,80), "memory-wiki", short(operation,120), short(target_table,80), short(target_id,160), short(before_json,9000), short(after_json,9000), short(redact_secrets(reason),1200), 1 if reversible else 0, 0, ts),
+            )
+        return mid
+
+    def _table_row(self, table: str, row_id: str, pk: str = "id") -> Dict[str, Any]:
+        if not table or not row_id:
+            return {}
+        allowed = {"claims":"id", "evidence":"id", "review_queue":"id", "secret_index":"id", "post_task_log":"id", "decisions":"id", "mistakes":"id", "project_profiles":"project_id", "task_capsules":"id", "entities":"id", "relations":"id"}
+        pk = allowed.get(table, pk)
+        if table not in allowed:
+            return {}
+        row = self._connect().execute(f"SELECT * FROM {table} WHERE {pk}=?", (row_id,)).fetchone()
+        return self._sanitize_row(row) if row else {}
+
+    def _mutation_log(self, limit:int=50, target_table:str="", target_id:str="", since_seconds:int=0)->Dict[str,Any]:
+        c=self._connect(); limit=max(1,min(int(limit or 50),500)); where=[]; params=[]
+        if target_table:
+            where.append("target_table=?"); params.append(target_table)
+        if target_id:
+            where.append("target_id=?"); params.append(target_id)
+        if since_seconds:
+            where.append("created_at>=?"); params.append(now()-max(1,int(since_seconds)))
+        sql="SELECT * FROM memory_mutations" + (" WHERE "+" AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        return {"events":[self._sanitize_row(r) for r in c.execute(sql, params).fetchall()]}
+
+    def _restore_row_from_json(self, table: str, row_id: str, before_json: str) -> Dict[str,Any]:
+        allowed = {"claims":"id", "project_profiles":"project_id", "entities":"id", "relations":"id", "task_capsules":"id", "post_task_log":"id", "decisions":"id", "mistakes":"id"}
+        pk = allowed.get(table)
+        if not pk:
+            return {"restored":False,"reason":"table not reversible"}
+        before = json.loads(before_json or "{}") if before_json else {}
+        c=self._connect()
+        with c:
+            if not before:
+                c.execute(f"DELETE FROM {table} WHERE {pk}=?", (row_id,))
+                if table == "claims":
+                    try: c.execute("DELETE FROM claims_fts WHERE id=?", (row_id,))
+                    except Exception: pass
+                return {"restored":True,"action":"delete_inserted"}
+            cols=[k for k in before.keys() if k != pk]
+            if c.execute(f"SELECT 1 FROM {table} WHERE {pk}=?", (row_id,)).fetchone():
+                sets=", ".join(f"{k}=?" for k in cols)
+                c.execute(f"UPDATE {table} SET {sets} WHERE {pk}=?", [before[k] for k in cols]+[row_id])
+            else:
+                keys=[pk]+cols
+                vals=[before.get(pk,row_id)]+[before[k] for k in cols]
+                c.execute(f"INSERT OR REPLACE INTO {table}({','.join(keys)}) VALUES({','.join('?' for _ in keys)})", vals)
+        if table == "claims":
+            self._upsert_fts(row_id)
+        self._render_dashboards()
+        return {"restored":True,"action":"restore_before"}
+
+    def _undo_last(self, mutation_id: str = "", dry_run: bool = True) -> Dict[str,Any]:
+        c=self._connect()
+        if mutation_id:
+            row=c.execute("SELECT * FROM memory_mutations WHERE id=?", (mutation_id,)).fetchone()
+        else:
+            row=c.execute("SELECT * FROM memory_mutations WHERE reversible=1 AND undone_at=0 ORDER BY created_at DESC LIMIT 1").fetchone()
+        if not row:
+            return {"found":False,"dry_run":dry_run}
+        event=self._sanitize_row(row)
+        result={"found":True,"dry_run":dry_run,"event":event,"would_restore":bool(row["before_json"]),"would_delete_inserted":not bool(row["before_json"])}
+        if dry_run:
+            return result
+        restored=self._restore_row_from_json(row["target_table"], row["target_id"], row["before_json"])
+        with c:
+            c.execute("UPDATE memory_mutations SET undone_at=? WHERE id=?", (now(), row["id"]))
+        self._record_mutation("undo", row["target_table"], row["target_id"], event, restored, f"undo {row['id']}", reversible=False)
+        result.update(restored); return result
+
+    def _write_firewall(self, a: Dict[str,Any]) -> Dict[str,Any]:
+        claim_raw=str(a.get("claim") or "")
+        evidence_raw=str(a.get("evidence") or "")
+        source=str(a.get("source") or "tool")
+        topic=a.get("topic") or self._infer_topic(claim_raw)
+        scan=secret_scan(claim_raw + "\n" + evidence_raw)
+        clean_claim=normalize_claim(scrub_memory_artifacts(claim_raw))
+        lint=lint_claim_text(clean_claim, topic)
+        policy=source_policy_for(source)
+        gate=memory_gate_decision(clean_claim, topic, source)
+        mode=(a.get("mode") or "check").lower()
+        out={"mode":mode,"policy":policy,"secret_scan":{"raw_secret":scan.get("raw_secret"),"mentions_secret":scan.get("mentions_secret"),"redaction_markers":scan.get("redaction_markers"),"risk":scan.get("risk"),"findings":scan.get("findings",[])},"lint":lint,"gate":gate,"normalized":clean_claim,"suggested_topic":self._topic_alias(topic, clean_claim)}
+        if mode == "queue" or (mode == "apply" and gate.get("action") == "queue"):
+            out["review_id"] = self._enqueue_review(clean_claim, topic, evidence_raw, source, str(gate.get("reason") or "manual queue"), float(a.get("confidence",.75)), float(a.get("salience",.7)))
+        elif mode == "apply" and gate.get("action") in ("accept", "redact"):
+            out["claim_id"] = self._add_claim(clean_claim, topic, evidence_raw, source, float(a.get("confidence",.75)), float(a.get("salience",.7)))
+        return out
+
+    def _source_policy_tool(self, source: str = "tool", claim: str = "", topic: str = "general") -> Dict[str,Any]:
+        policy=source_policy_for(source)
+        out={"source":source,"policy":policy}
+        if claim:
+            out["firewall"] = self._write_firewall({"claim":claim,"topic":topic,"source":source,"mode":"check"})
+        return out
 
     def _sanitize_row(self, row: Dict[str, Any] | sqlite3.Row) -> Dict[str, Any]:
         """Last-mile guard: public recall/export/tool rows must never expose raw secrets."""
@@ -1038,9 +1228,32 @@ class MemoryWikiProvider(MemoryProvider):
     def _why_believe(self, claim_id: str) -> Dict[str, Any]:
         c=self._connect(); r=c.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
         if not r: raise ValueError(f"claim not found: {claim_id}")
-        ev=[self._sanitize_row(x) for x in c.execute("SELECT * FROM evidence WHERE claim_id=? ORDER BY created_at DESC LIMIT 8", (claim_id,)).fetchall()]
-        cons=[self._sanitize_row(x) for x in c.execute("SELECT * FROM contradictions WHERE (claim_a=? OR claim_b=?) ORDER BY created_at DESC LIMIT 8", (claim_id,claim_id)).fetchall()]
-        return {"claim": self._sanitize_row(r), "evidence": ev, "contradictions": cons, "why": {"confidence": r["confidence"], "salience": r["salience"], "trust_score": r["trust_score"] if "trust_score" in r.keys() else .55, "verification_status": r["verification_status"] if "verification_status" in r.keys() else "unverified", "source_type": r["source_type"] if "source_type" in r.keys() else infer_source_type(r["source"])}}
+        ev=[self._sanitize_row(x) for x in c.execute("SELECT * FROM evidence WHERE claim_id=? ORDER BY created_at DESC LIMIT 12", (claim_id,)).fetchall()]
+        cons=[self._sanitize_row(x) for x in c.execute("SELECT * FROM contradictions WHERE (claim_a=? OR claim_b=?) ORDER BY created_at DESC LIMIT 12", (claim_id,claim_id)).fetchall()]
+        mutations=[self._sanitize_row(x) for x in c.execute("SELECT * FROM memory_mutations WHERE target_table='claims' AND target_id=? ORDER BY created_at DESC LIMIT 8", (claim_id,)).fetchall()]
+        recalls=[self._sanitize_row(x) for x in c.execute("SELECT * FROM recall_events WHERE claim_id=? ORDER BY created_at DESC LIMIT 8", (claim_id,)).fetchall()]
+        custody={}
+        try: custody=json.loads(r["custody"] or "{}") if "custody" in r.keys() else {}
+        except Exception: custody={}
+        source_policy=source_policy_for(r["source"] if "source" in r.keys() else "")
+        trust={
+            "confidence": r["confidence"], "salience": r["salience"],
+            "quality": r["quality"] if "quality" in r.keys() else claim_quality(r["claim"], r["topic"]),
+            "trust_score": r["trust_score"] if "trust_score" in r.keys() else .55,
+            "trust_class": r["trust_class"] if "trust_class" in r.keys() else memory_classify(r["claim"], r["topic"], r["source"]).get("class"),
+            "risk": r["risk"] if "risk" in r.keys() else "low",
+            "verification_status": r["verification_status"] if "verification_status" in r.keys() else "unverified",
+            "source_type": r["source_type"] if "source_type" in r.keys() else infer_source_type(r["source"]),
+            "source_policy": source_policy,
+            "custody": custody,
+            "evidence_count": len(ev),
+            "contradiction_count": len(cons),
+            "recall_count": r["recall_count"] if "recall_count" in r.keys() else 0,
+            "last_verified_at": r["last_verified_at"] if "last_verified_at" in r.keys() else 0,
+            "last_recalled": r["last_recalled"] if "last_recalled" in r.keys() else 0,
+            "stale": self._is_stale(r["freshness_at"]),
+        }
+        return {"claim": self._sanitize_row(r), "evidence": ev, "contradictions": cons, "mutations": mutations, "recalls": recalls, "why": trust}
 
     def _topic_alias(self, topic: str, claim: str = "") -> str:
         t=canonical_topic(topic, claim); c=self._connect()
@@ -1125,17 +1338,50 @@ class MemoryWikiProvider(MemoryProvider):
         return {"mode":mode,"actions":actions,"applied":applied}
 
     def _compress_topic(self, topic: str, mode: str = "suggest", limit: int = 30) -> Dict[str, Any]:
-        t=self._topic_alias(topic or 'general'); c=self._connect(); rows=[dict(r) for r in c.execute("SELECT * FROM claims WHERE topic=? AND status='active' ORDER BY pinned DESC, salience DESC, confidence DESC, updated_at DESC LIMIT ?", (t,max(3,min(int(limit or 30),80)))).fetchall()]
-        if not rows: return {"topic":t,"summary":"","claim_id":"","superseded":0}
-        bullets='; '.join(short(r['claim'],140) for r in rows[:12])
-        summary=short(f"Topic summary for {t}: {bullets}", 1200)
-        if mode!='apply': return {"topic":t,"summary":summary,"candidates":[r['id'] for r in rows]}
-        cid=self._add_claim(summary,t,json.dumps({"compressed_ids":[r['id'] for r in rows]},ensure_ascii=False),"memory_wiki_compress_topic",.82,.86)
+        return self._compile_topic(topic, mode, limit, "summary")
+
+    def _compile_topic(self, topic: str, mode: str = "suggest", limit: int = 50, summary_type: str = "summary") -> Dict[str, Any]:
+        """Deterministic claim compiler: many microfacts -> one curated summary claim."""
+        t=self._topic_alias(topic or 'general'); c=self._connect(); lim=max(5,min(int(limit or 50),160))
+        rows=[dict(r) for r in c.execute("""SELECT * FROM claims
+            WHERE topic=? AND status='active' AND id NOT LIKE 'c_summary_%' AND source NOT IN ('memory_wiki_compress_topic','memory_wiki_compile_topic')
+            ORDER BY pinned DESC, salience DESC, confidence DESC, trust_score DESC, updated_at DESC LIMIT ?""", (t,lim)).fetchall()]
+        rows=[r for r in rows if not is_ephemeral_fragment(r.get('claim','')) and str(r.get('risk','low'))!='secret' and int(r.get('quarantined_at') or 0)==0]
+        if not rows: return {"topic":t,"summary":"","claim_id":"","superseded":0,"candidates":[]}
+        by_type={}
+        for r in rows:
+            by_type.setdefault(str(r.get('type') or r.get('trust_class') or 'fact'), []).append(r)
+        order=['preference','procedure','environment','decision','lesson','task_result','fact']
+        lines=[]
+        title={"summary":"summary","runbook":"runbook","profile":"profile","timeline":"timeline","decision":"decision log"}.get(summary_type, 'summary')
+        lines.append(f"Compiled {title} for topic {t}:")
+        for typ in order + sorted(k for k in by_type if k not in order):
+            group=by_type.get(typ) or []
+            if not group: continue
+            best=[]
+            for r in group[:8]:
+                best.append(short(r['claim'], 180))
+            lines.append(f"{typ}: " + "; ".join(best))
+        summary=short(" ".join(lines), 1800)
+        candidate_ids=[r['id'] for r in rows]
+        result={"topic":t,"summary_type":summary_type,"summary":summary,"candidates":candidate_ids,"would_supersede":[],"mode":mode}
+        for r in rows[8:]:
+            if not int(r.get('pinned') or 0) and float(r.get('salience') or 0) < .92:
+                result['would_supersede'].append(r['id'])
+        if mode!='apply': return result
+        cid=self._add_claim(summary,t,json.dumps({"compiled_ids":candidate_ids,"summary_type":summary_type},ensure_ascii=False),"memory_wiki_compile_topic",.90,.92)
         superseded=0
         with c:
-            for r in rows[5:]:
-                if not int(r.get('pinned') or 0): c.execute("UPDATE claims SET status='superseded', updated_at=? WHERE id=?", (now(),r['id'])); superseded+=1
-        self._add_change('topic_compress', cid, f"{t}: superseded {superseded}"); self._render_all(); return {"topic":t,"summary":summary,"claim_id":cid,"superseded":superseded}
+            for rid in result['would_supersede']:
+                before=self._table_row('claims', rid)
+                c.execute("UPDATE claims SET status='superseded', derived_from=CASE WHEN derived_from='' THEN ? ELSE derived_from END, updated_at=? WHERE id=?", (cid, now(), rid))
+                self._record_mutation('compile_topic_supersede', 'claims', rid, before, self._table_row('claims', rid), f"compiled into {cid}")
+                superseded+=1
+            try:
+                c.execute("UPDATE claims SET type='procedure', trust_class='procedure', quality_flags=?, derived_from=? WHERE id=?", (json.dumps(['compiled_topic_summary'], ensure_ascii=False), json.dumps(candidate_ids, ensure_ascii=False), cid))
+            except Exception:
+                pass
+        self._add_change('topic_compile', cid, f"{t}: superseded {superseded}"); self._rebuild_fts(); self._render_all(); result.update({"claim_id":cid,"superseded":superseded}); return result
 
     def _resolve_by_policy(self, contradiction_id: str, policy: str = "prefer_explicit_user") -> Dict[str, Any]:
         c=self._connect(); k=c.execute("SELECT * FROM contradictions WHERE id=?", (contradiction_id,)).fetchone()
@@ -1192,6 +1438,8 @@ class MemoryWikiProvider(MemoryProvider):
                 else:
                     c.execute("INSERT INTO claims(id,claim,topic,status,confidence,salience,source,evidence,created_at,updated_at,freshness_at,hash,quality,pinned,normalized_claim,type,source_type,verification_status,last_verified_at,scope,project_id,usefulness,recall_count,last_recalled,trust_class,trust_score,risk,custody,quarantined_at,quality_flags,source_ref,derived_from,review_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (cid, claim, topic, "active", clamp(confidence), clamp(salience), redact_secrets(source), short(evidence,2000), ts, ts, ts, h, quality, pinned, normalized, ctype, stype, "unverified", 0, scope, project_id, .5, 0, 0, tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"], ts if str(tm["risk"])=="secret" else 0, json.dumps(flags,ensure_ascii=False), source_ref, "", review_state))
                 if evidence: self._add_evidence(cid, evidence, "support", source, commit=False)
+                after_row = self._table_row("claims", cid)
+                self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source)
             self._upsert_fts(cid); self._detect_contradictions_for(cid); self._add_change("upsert_claim", cid, claim); self._render_topic(topic); self._render_dashboards()
         return cid
 
@@ -1321,7 +1569,9 @@ class MemoryWikiProvider(MemoryProvider):
             if a.get(k) is not None: fields.append(f"{k}=?"); vals.append(clamp(float(a[k])))
         if a.get("refresh"): fields.append("freshness_at=?"); vals.append(now())
         fields.append("updated_at=?"); vals.append(now()); vals.append(cid)
+        before = self._sanitize_row(row)
         with c: c.execute(f"UPDATE claims SET {', '.join(fields)} WHERE id=?", vals)
+        self._record_mutation("update_claim", "claims", cid, before, self._table_row("claims", cid), a.get("reason") or "memory_wiki_update_claim")
         self._upsert_fts(cid); self._render_all(); return {"id": cid, "updated": True}
 
     def _set_status_by_text(self, text: str, status: str, reason: str) -> None:
@@ -1472,6 +1722,7 @@ class MemoryWikiProvider(MemoryProvider):
             ("android", ("android","termux","андроид","apk","oauth","proot")),
             ("hermes", ("hermes","plugin","tool registry","плагин","память")),
             ("telegram", ("telegram","bot token","tg_","чат","канал")),
+            ("openclaw", ("openclaw","openclaw.json","/home/.openclaw")),
             ("server", ("vps","server","systemd","ssh","nginx","port","health","сервер","сервис")),
             ("proxy", ("proxy","прокси","gateway","deepseek")),
             ("api", ("api","openai","model","gpt","claude","endpoint")),
@@ -1782,9 +2033,11 @@ class MemoryWikiProvider(MemoryProvider):
         c = self._connect(); row = c.execute("SELECT * FROM claims WHERE id=?", (cid,)).fetchone()
         if not row: raise ValueError(f"claim not found: {cid}")
         topic = slug(a.get("topic") or row["topic"] or self._infer_topic(new_claim)); h = sha(new_claim.lower()); ts = now()
+        before = self._sanitize_row(row)
         with c:
             c.execute("UPDATE claims SET claim=?, normalized_claim=?, hash=?, topic=?, type=?, quality=?, updated_at=? WHERE id=?", (new_claim, new_claim, h, topic, infer_claim_type(new_claim, topic), claim_quality(new_claim, topic), ts, cid))
             self._add_evidence(cid, f"rewrite: {reason}; old: {short(row['claim'],500)}", "note", "memory_wiki_rewrite_claim", commit=False)
+        self._record_mutation("rewrite_claim", "claims", cid, before, self._table_row("claims", cid), reason)
         self._upsert_fts(cid); self._render_all()
         return {"id": cid, "topic": topic, "quality": claim_quality(new_claim, topic), "rewritten": True}
 
@@ -1815,8 +2068,26 @@ class MemoryWikiProvider(MemoryProvider):
         if topics: issues.append("bad topics need retopic")
         if blobs: issues.append("raw logs/json blobs should be summarized or retired")
         if secrets: issues.append("potential secrets require scrub")
-        score = 1.0 - min(0.85, (len(bad)*0.01 + len(topics)*0.008 + len(blobs)*0.012 + len(secrets)*0.03 + len(metrics["schema_missing"])*0.1))
-        return {"version":"1.1.1-quality","health_score":round(score,3),"metrics":metrics,"issues":issues,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
+        top_artifacts=0
+        for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY salience DESC, confidence DESC LIMIT 80").fetchall():
+            if not r['id'].startswith('c_summary_') and (is_ephemeral_fragment(r['claim']) or str(r['trust_class'] if 'trust_class' in r.keys() else '') in ('tool_log','raw_blob','secret')):
+                top_artifacts += 1
+        eval_score = 1.0
+        try:
+            eval_score = float(self._evaluate_retrieval(5, 2500).get('score', 1.0))
+        except Exception:
+            eval_score = 0.75
+        components={
+            'db_health': 0.0 if metrics['schema_missing'] else 1.0,
+            'secret_health': 1.0 - min(1.0, len(secrets)*0.10),
+            'semantic_quality': 1.0 - min(1.0, len(bad)*0.03 + len(topics)*0.02 + len(blobs)*0.04),
+            'artifact_pollution': 1.0 - min(1.0, top_artifacts*0.06),
+            'retrieval_quality': eval_score,
+            'contradiction_health': 1.0 - min(1.0, c.execute("SELECT count(*) n FROM contradictions WHERE status='open'").fetchone()['n']*0.015),
+        }
+        metrics.update({'top_artifacts':top_artifacts,'health_components':components})
+        score = sum(components.values()) / max(1, len(components))
+        return {"version":"1.2.0-memory-os","health_score":round(score,3),"metrics":metrics,"issues":issues,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
 
     def _explain_recall(self, query: str, limit: int = 10, topic: Optional[str]=None) -> List[Dict[str, Any]]:
         rows = self._search(query, limit, True, topic); qt=tokens(query); out=[]
@@ -1877,7 +2148,7 @@ class MemoryWikiProvider(MemoryProvider):
             (('android','termux','phone','proot','андроид'), 'android'),
             (('hermes','plugin','плагин','tool'), 'hermes'),
             (('сервер','server','ssh','vps','service','systemd'), 'server'),
-            (('project','workspace','repo','repository'), 'projects'),
+            (('рустем','rustem','openclaw'), 'openclaw'),
             (('telegram','телеграм','bot','бот'), 'telegram'),
             (('preference','preferences','предпочитает','пользователь'), 'preferences'),
         ]
@@ -2081,10 +2352,31 @@ class MemoryWikiProvider(MemoryProvider):
         return {'id':mid,'claim_id':cid}
 
     def _add_project_profile(self,a):
-        pid=slug(a.get('project_id') or 'project'); ts=now(); root=normalize_claim(a.get('root') or ''); purpose=normalize_claim(a.get('purpose') or ''); commands=list(a.get('commands') or []); services=list(a.get('services') or []); notes=normalize_claim(a.get('notes') or '')
-        with self._connect() as c: c.execute('INSERT OR REPLACE INTO project_profiles(project_id,root,purpose,commands,services,notes,updated_at) VALUES(?,?,?,?,?,?,?)',(pid,root,purpose,json.dumps(commands,ensure_ascii=False),json.dumps(services,ensure_ascii=False),notes,ts))
-        cid=self._add_claim(f'Project profile {pid}: root={root or "n/a"}; purpose={purpose or "n/a"}; commands={commands}; services={services}; notes={notes}', 'projects', 'Project profile', 'project_profile', .9, .86)
-        return {'project_id':pid,'claim_id':cid}
+        pid=slug(a.get('project_id') or 'project'); ts=now()
+        raw_blob=json.dumps(a, ensure_ascii=False, default=str)
+        raw_secret=bool(secret_scan(raw_blob).get('raw_secret'))
+        root=normalize_claim(redact_secrets(a.get('root') or '')); purpose=normalize_claim(redact_secrets(a.get('purpose') or ''))
+        commands=[short(redact_secrets(str(x)), 500) for x in list(a.get('commands') or [])[:80]]
+        services=[short(redact_secrets(str(x)), 300) for x in list(a.get('services') or [])[:80]]
+        notes=normalize_claim(redact_secrets(a.get('notes') or ''))
+        stack=a.get('stack') or a.get('stack_json') or {}
+        if isinstance(stack, str):
+            try: stack=json.loads(stack)
+            except Exception: stack={"raw": short(redact_secrets(stack), 800)}
+        status=normalize_claim(redact_secrets(a.get('current_status') or ''))
+        last_verified=int(a.get('last_verified_at') or (ts if a.get('verified') else 0))
+        before=self._table_row('project_profiles', pid, 'project_id')
+        if raw_secret:
+            self._quarantine_secret('project_profiles', pid, 'payload', raw_blob, 'add_project_profile_raw_secret')
+            self._make_secret_index_from_raw('project_profiles', pid, 'payload', raw_blob, json.dumps({'root':root,'purpose':purpose,'commands':commands,'services':services,'notes':notes,'stack':stack,'status':status}, ensure_ascii=False))
+        with self._connect() as c:
+            c.execute("""INSERT INTO project_profiles(project_id,root,purpose,commands,services,notes,updated_at,stack_json,current_status,last_verified_at,scope,source)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(project_id) DO UPDATE SET root=excluded.root,purpose=excluded.purpose,commands=excluded.commands,services=excluded.services,notes=excluded.notes,updated_at=excluded.updated_at,stack_json=excluded.stack_json,current_status=excluded.current_status,last_verified_at=excluded.last_verified_at,scope=excluded.scope,source=excluded.source""",(pid,root,purpose,json.dumps(commands,ensure_ascii=False),json.dumps(services,ensure_ascii=False),notes,ts,json.dumps(stack,ensure_ascii=False,sort_keys=True),status,last_verified,'project','project_profile'))
+        after=self._table_row('project_profiles', pid, 'project_id')
+        self._record_mutation('upsert_project_profile','project_profiles',pid,before,after,'memory_wiki_add_project_profile')
+        cid=self._add_claim(f'Project profile {pid}: root={root or "n/a"}; purpose={purpose or "n/a"}; commands={commands[:8]}; services={services[:8]}; status={status or "n/a"}; notes={notes}', 'projects', 'Project profile', 'project_profile', .9, .86)
+        return {'project_id':pid,'claim_id':cid,'secret_quarantined':raw_secret}
 
 
     def _add_task_capsule(self,a):
@@ -2127,27 +2419,178 @@ class MemoryWikiProvider(MemoryProvider):
         return {'id':tid,'claim_id':cid}
 
     def _add_entity(self,a):
-        name=normalize_claim(a.get('name') or ''); et=slug(a.get('entity_type') or 'thing'); aliases=list(a.get('aliases') or []); notes=normalize_claim(a.get('notes') or ''); h=sha(name.lower()+et); eid='ent_'+h[:12]
+        raw_name=str(a.get('name') or '')
+        raw_aliases=list(a.get('aliases') or [])
+        raw_notes=str(a.get('notes') or '')
+        name=normalize_claim(redact_secrets(raw_name))
+        et=slug(a.get('entity_type') or 'thing')
+        aliases=[normalize_claim(redact_secrets(str(x))) for x in raw_aliases if normalize_claim(redact_secrets(str(x)))]
+        notes=normalize_claim(redact_secrets(raw_notes))
+        h=sha(name.lower()+et); eid='ent_'+h[:12]
+        if not name: raise ValueError('empty entity name')
+        before=self._table_row('entities', eid)
+        if secret_scan(raw_name+' '+json.dumps(raw_aliases, ensure_ascii=False)+' '+raw_notes).get('raw_secret'):
+            raw_payload=raw_name+'\n'+json.dumps(raw_aliases, ensure_ascii=False)+'\n'+raw_notes
+            self._quarantine_secret('entities', eid, 'payload', raw_payload, 'add_entity_raw_secret')
+            self._make_secret_index_from_raw('entities', eid, 'payload', raw_payload, name+'\n'+json.dumps(aliases, ensure_ascii=False)+'\n'+notes)
         with self._connect() as c: c.execute('INSERT OR REPLACE INTO entities(id,name,entity_type,aliases,notes,updated_at,hash) VALUES(?,?,?,?,?,?,?)',(eid,name,et,json.dumps(aliases,ensure_ascii=False),notes,now(),h))
+        self._record_mutation('upsert_entity','entities',eid,before,self._table_row('entities', eid),'memory_wiki_add_entity')
         return {'id':eid}
 
     def _add_relation(self,a):
-        subj=normalize_claim(a.get('subject') or ''); pred=slug(a.get('predicate') or 'related_to'); obj=normalize_claim(a.get('object') or ''); h=sha(subj.lower()+pred+obj.lower()); rid='rel_'+h[:12]
-        with self._connect() as c: c.execute('INSERT OR IGNORE INTO relations(id,subject,predicate,object,confidence,evidence,created_at,hash) VALUES(?,?,?,?,?,?,?,?)',(rid,subj,pred,obj,clamp(float(a.get('confidence',.8))),normalize_claim(a.get('evidence') or ''),now(),h))
+        raw_subj=str(a.get('subject') or ''); raw_obj=str(a.get('object') or ''); raw_ev=str(a.get('evidence') or '')
+        subj=normalize_claim(redact_secrets(raw_subj)); pred=slug(a.get('predicate') or 'related_to'); obj=normalize_claim(redact_secrets(raw_obj)); evidence=normalize_claim(redact_secrets(raw_ev))
+        h=sha(subj.lower()+pred+obj.lower()); rid='rel_'+h[:12]
+        if not subj or not obj: raise ValueError('empty relation endpoint')
+        before=self._table_row('relations', rid)
+        if secret_scan(raw_subj+' '+raw_obj+' '+raw_ev).get('raw_secret'):
+            raw_payload=raw_subj+'\n'+raw_obj+'\n'+raw_ev
+            self._quarantine_secret('relations', rid, 'payload', raw_payload, 'add_relation_raw_secret')
+            self._make_secret_index_from_raw('relations', rid, 'payload', raw_payload, subj+'\n'+obj+'\n'+evidence)
+        with self._connect() as c: c.execute('INSERT OR IGNORE INTO relations(id,subject,predicate,object,confidence,evidence,created_at,hash) VALUES(?,?,?,?,?,?,?,?)',(rid,subj,pred,obj,clamp(float(a.get('confidence',.8))),evidence,now(),h))
+        self._record_mutation('upsert_relation','relations',rid,before,self._table_row('relations', rid),'memory_wiki_add_relation')
         return {'id':rid}
 
     def _graph_query(self, query:str, limit:int=20)->Dict[str,Any]:
-        q=query.lower(); ents=[]; rels=[]; c=self._connect()
+        q=str(query or '').lower(); qtokens=tokens(q); ents=[]; rels=[]; c=self._connect(); lim=max(1,min(int(limit or 20),200))
         for r in c.execute('SELECT * FROM entities ORDER BY updated_at DESC LIMIT 500').fetchall():
             hay=(r['name']+' '+r['aliases']+' '+r['notes']).lower()
-            if q in hay or any(t in hay for t in tokens(q)): ents.append(dict(r))
-            if len(ents)>=limit: break
+            if (q and q in hay) or any(t in hay for t in qtokens): ents.append(self._sanitize_row(r))
+            if len(ents)>=lim: break
         names={e['name'] for e in ents}
         for r in c.execute('SELECT * FROM relations ORDER BY created_at DESC LIMIT 1000').fetchall():
             hay=(r['subject']+' '+r['predicate']+' '+r['object']+' '+r['evidence']).lower()
-            if q in hay or r['subject'] in names or r['object'] in names or any(t in hay for t in tokens(q)): rels.append(dict(r))
-            if len(rels)>=limit: break
-        return {'entities':ents[:limit], 'relations':rels[:limit]}
+            if (q and q in hay) or r['subject'] in names or r['object'] in names or any(t in hay for t in qtokens): rels.append(self._sanitize_row(r))
+            if len(rels)>=lim: break
+        return {'entities':ents[:lim], 'relations':rels[:lim]}
+
+    def _get_project_context(self, project_id: str, query: str = "", limit: int = 20) -> Dict[str,Any]:
+        pid=slug(project_id or current_project_id() or 'project'); lim=max(1,min(int(limit or 20),80)); c=self._connect()
+        profile=c.execute("SELECT * FROM project_profiles WHERE project_id=?", (pid,)).fetchone()
+        q=query or pid
+        claims=[self._sanitize_row(r) for r in self._search(q, lim, False) if (r.get('project_id') in ('', pid) or pid in str(r.get('claim','')).lower())]
+        tasks=[]
+        for r in c.execute("SELECT * FROM task_capsules ORDER BY created_at DESC LIMIT 120").fetchall():
+            blob=' '.join(str(r[k]) for k in r.keys()).lower()
+            if pid in blob or any(t in blob for t in tokens(q)):
+                tasks.append(self._sanitize_row(r))
+            if len(tasks)>=lim: break
+        graph=self._graph_query(pid + ' ' + q, lim)
+        return {"project_id":pid,"profile":self._sanitize_row(profile) if profile else None,"claims":claims[:lim],"task_capsules":tasks[:lim],"graph":graph}
+
+    def _transaction(self, operations: List[Dict[str,Any]], mode: str = "suggest", reason: str = "") -> Dict[str,Any]:
+        mode=(mode or 'suggest').lower(); ops=list(operations or [])[:50]; batch_id='batch_'+sha(json.dumps(ops, ensure_ascii=False, sort_keys=True, default=str)+str(now()))[:12]
+        backup=None; results=[]
+        if mode == 'apply_with_backup':
+            backup=self._backup('transaction_'+batch_id)
+            mode='apply'
+        for op in ops:
+            name=str(op.get('tool') or op.get('operation') or '').strip()
+            args=dict(op.get('args') or {k:v for k,v in op.items() if k not in ('tool','operation','args')})
+            try:
+                if mode == 'suggest':
+                    if name in ('memory_wiki_compress_topic','memory_wiki_compile_topic','compile_topic'):
+                        results.append({'operation':name,'result':self._compile_topic(args.get('topic') or 'general','suggest',int(args.get('limit',50)),args.get('summary_type') or 'summary')})
+                    elif name in ('memory_wiki_scrub_secrets','scrub_secrets'):
+                        results.append({'operation':name,'result':self._scrub_secrets(False,int(args.get('limit',200)))})
+                    elif name in ('memory_wiki_normalize_topics','normalize_topics'):
+                        results.append({'operation':name,'result':self._normalize_topics('suggest',int(args.get('limit',100)))})
+                    elif name in ('memory_wiki_immune_scan','immune_scan'):
+                        results.append({'operation':name,'result':self._immune_scan('suggest',int(args.get('limit',100)))})
+                    elif name in ('memory_wiki_repair','repair'):
+                        results.append({'operation':name,'result':self._repair(args.get('target') or 'all', True)})
+                    elif name in ('memory_wiki_update_claim','update_claim','memory_wiki_rewrite_claim','rewrite_claim'):
+                        cid=args.get('claim_id') or ''; results.append({'operation':name,'before':self._table_row('claims', cid),'dry_run':True})
+                    else:
+                        results.append({'operation':name,'dry_run':True,'note':'suggest mode: operation not executed'})
+                else:
+                    before_count=self._connect().execute("SELECT count(*) n FROM claims").fetchone()['n']
+                    if name in ('memory_wiki_update_claim','update_claim'):
+                        res=self._update_claim(args)
+                    elif name in ('memory_wiki_rewrite_claim','rewrite_claim'):
+                        res=self._rewrite_claim(args)
+                    elif name in ('memory_wiki_merge_claims','merge_claims'):
+                        res=self._merge_claims(args)
+                    elif name in ('memory_wiki_compress_topic','memory_wiki_compile_topic','compile_topic'):
+                        res=self._compile_topic(args.get('topic') or 'general','apply',int(args.get('limit',50)),args.get('summary_type') or 'summary')
+                    elif name in ('memory_wiki_scrub_secrets','scrub_secrets'):
+                        res=self._scrub_secrets(True,int(args.get('limit',200)))
+                    elif name in ('memory_wiki_normalize_topics','normalize_topics'):
+                        res=self._normalize_topics('apply',int(args.get('limit',100)))
+                    elif name in ('memory_wiki_immune_scan','immune_scan'):
+                        res=self._immune_scan('apply',int(args.get('limit',100)))
+                    elif name in ('memory_wiki_repair','repair'):
+                        res=self._repair(args.get('target') or 'all', False)
+                    else:
+                        raise ValueError(f'unsupported transaction operation: {name}')
+                    after_count=self._connect().execute("SELECT count(*) n FROM claims").fetchone()['n']
+                    mid=self._record_mutation('transaction_operation','batch',batch_id,{"claims":before_count},{"claims":after_count,"result":res},reason or name,batch_id,False)
+                    results.append({'operation':name,'mutation_id':mid,'result':res})
+            except Exception as e:
+                results.append({'operation':name,'error':str(e)})
+        self._audit('transaction', 'ok' if not any('error' in r for r in results) else 'partial', f'{batch_id} ops={len(ops)} mode={mode}')
+        return {"batch_id":batch_id,"mode":mode,"backup":backup,"results":results,"errors":[r for r in results if 'error' in r]}
+
+    def _export_bundle(self, a: Dict[str,Any]) -> Dict[str,Any]:
+        c=self._connect(); limit=max(1,min(int(a.get('limit',500) or 500),5000)); topic=self._topic_alias(a.get('topic') or '', '') if a.get('topic') else ''; project_id=slug(a.get('project_id') or '') if a.get('project_id') else ''; scope=str(a.get('scope') or '')
+        where=["1=1"]; params=[]
+        if topic: where.append("topic=?"); params.append(topic)
+        if project_id: where.append("(project_id=? OR claim LIKE ?)"); params.extend([project_id, f'%{project_id}%'])
+        if scope: where.append("scope=?"); params.append(scope)
+        sql="SELECT * FROM claims WHERE "+" AND ".join(where)+" ORDER BY updated_at DESC LIMIT ?"; params.append(limit)
+        claims=[self._sanitize_row(r) for r in c.execute(sql, params).fetchall()]
+        claim_ids=[r['id'] for r in claims]
+        evidence=[]
+        if claim_ids:
+            qs=','.join('?' for _ in claim_ids[:900])
+            evidence=[self._sanitize_row(r) for r in c.execute(f"SELECT * FROM evidence WHERE claim_id IN ({qs}) ORDER BY created_at DESC LIMIT ?", claim_ids[:900]+[limit]).fetchall()]
+        payload={
+            'format':'memory-wiki-sync-bundle/v1', 'created_at':now(), 'source_home':str(self.home),
+            'filters':{'topic':topic,'project_id':project_id,'scope':scope,'limit':limit},
+            'claims':claims, 'evidence':evidence,
+            'project_profiles':[self._sanitize_row(r) for r in c.execute("SELECT * FROM project_profiles ORDER BY updated_at DESC LIMIT ?", (min(limit,500),)).fetchall()],
+            'entities':[self._sanitize_row(r) for r in c.execute("SELECT * FROM entities ORDER BY updated_at DESC LIMIT ?", (min(limit,500),)).fetchall()],
+            'relations':[self._sanitize_row(r) for r in c.execute("SELECT * FROM relations ORDER BY created_at DESC LIMIT ?", (min(limit,800),)).fetchall()],
+            'secret_index':[self._sanitize_row(r) for r in c.execute("SELECT id,subject,scope,secret_type,locator,'' as value,purpose,source,confidence,salience,status,last_verified_at,created_at,updated_at,hash FROM secret_index ORDER BY updated_at DESC LIMIT ?", (min(limit,500),)).fetchall()],
+        }
+        payload_hash=sha(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        path=''
+        if bool(a.get('write_file', True)):
+            outdir=self.root/'sync-bundles'; outdir.mkdir(parents=True, exist_ok=True)
+            path=str(outdir/(time.strftime('%Y%m%d_%H%M%S', time.localtime(now()))+f'_{payload_hash[:10]}.json'))
+            atomic_write(Path(path), json.dumps(payload, ensure_ascii=False, indent=2)+"\n")
+        bid='sync_'+payload_hash[:12]
+        with c: c.execute("INSERT OR REPLACE INTO sync_bundles(id,path,summary,payload_hash,direction,created_at) VALUES(?,?,?,?,?,?)", (bid,path,json.dumps(payload['filters'],ensure_ascii=False),payload_hash,'export',now()))
+        return {'id':bid,'path':path,'payload_hash':payload_hash,'counts':{k:len(v) for k,v in payload.items() if isinstance(v,list)},'payload':payload if not bool(a.get('write_file', True)) else {}}
+
+    def _import_bundle(self, a: Dict[str,Any]) -> Dict[str,Any]:
+        payload=a.get('payload') or {}
+        p=a.get('path') or ''
+        if not payload and p:
+            payload=json.loads(Path(p).read_text(encoding='utf-8'))
+        if not isinstance(payload, dict) or not str(payload.get('format','')).startswith('memory-wiki-sync-bundle'):
+            raise ValueError('invalid memory-wiki sync bundle')
+        mode=(a.get('mode') or 'suggest').lower(); counts={}; created=[]
+        if mode == 'suggest':
+            return {'mode':mode,'counts':{k:len(v) for k,v in payload.items() if isinstance(v,list)},'filters':payload.get('filters',{}),'would_import':True}
+        c=self._connect()
+        with c:
+            for r in payload.get('claims') or []:
+                claim=normalize_claim(r.get('claim') or '')
+                if not claim or secret_scan(claim + ' ' + str(r.get('evidence',''))).get('raw_secret'):
+                    continue
+                cid=self._add_claim(claim, r.get('topic') or self._infer_topic(claim), r.get('evidence') or '', 'memory_wiki_import_bundle', float(r.get('confidence',.65)), float(r.get('salience',.55)))
+                created.append(cid); counts['claims']=counts.get('claims',0)+1
+            for r in payload.get('project_profiles') or []:
+                self._add_project_profile(r); counts['project_profiles']=counts.get('project_profiles',0)+1
+            for r in payload.get('entities') or []:
+                self._add_entity(r); counts['entities']=counts.get('entities',0)+1
+            for r in payload.get('relations') or []:
+                self._add_relation(r); counts['relations']=counts.get('relations',0)+1
+        payload_hash=sha(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)); bid='sync_'+payload_hash[:12]
+        with c: c.execute("INSERT OR REPLACE INTO sync_bundles(id,path,summary,payload_hash,direction,created_at) VALUES(?,?,?,?,?,?)", (bid,p,json.dumps(payload.get('filters',{}),ensure_ascii=False),payload_hash,'import',now()))
+        self._rebuild_fts(); self._render_all(); self._audit('import_bundle','ok',f'{bid} counts={counts}')
+        return {'mode':mode,'id':bid,'payload_hash':payload_hash,'counts':counts,'created_claims':created[:100]}
 
     def _apply_user_correction(self,a):
         corr=normalize_claim(a.get('correction') or ''); target=a.get('target_claim_id') or ''; topic=self._topic_alias(a.get('topic') or 'corrections', corr); changed=[]
@@ -2214,16 +2657,16 @@ class MemoryWikiProvider(MemoryProvider):
             return (m.group(1).strip().strip('"\'') if m else default)
         base_url=os.environ.get('MEMORY_WIKI_LLM_BASE_URL') or grab('base_url','http://127.0.0.1:18646/v1')
         api_key=os.environ.get('MEMORY_WIKI_LLM_API_KEY') or grab('api_key','noop')
-        model=os.environ.get('MEMORY_WIKI_LLM_MODEL') or grab('model','local-model')
+        model=os.environ.get('MEMORY_WIKI_LLM_MODEL') or grab('model','gpt-5.5')
         if not base_url:
             return ''
         endpoint=base_url.rstrip('/') + '/chat/completions'
         budget=max(700, min(max_chars, 30000))
-        system=("You are a secondary context analyst for memory_wiki_pack_context. "
-                "Analyze candidate claims/task_capsules/session history/graph/secret index and return only context that should be loaded into the active chat. "
-                "Do not reveal secrets; keep ids, paths, commands and concrete verification notes. No reasoning transcript.")
+        system=("Ты вторичная модель gpt-5.5 для memory_wiki_pack_context. "
+                "Проанализируй кандидаты из claims/task_capsules/session history/graph/secret index и верни только данные, которые надо подгрузить в рабочий чат. "
+                "Не раскрывай секреты; сохраняй ids, paths, команды и конкретные выводы. Без рассуждений и воды.")
         user=(f"QUERY:\n{query}\n\nMAX_CHARS: {budget}\n\nCANDIDATE_CONTEXT:\n{candidate_context[:90000]}\n\n"
-              "Return compact packed context as markdown bullets sorted by usefulness.")
+              "Верни компактный packed context в markdown bullets, отсортированный по полезности.")
         payload={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':user}], 'max_tokens':max(512, min(8192, budget//2)), 'temperature':0}
         try:
             req=urllib.request.Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers={'Content-Type':'application/json','Authorization':f'Bearer {api_key}'}, method='POST')
@@ -2250,8 +2693,11 @@ class MemoryWikiProvider(MemoryProvider):
             ('procedures','## Procedures / runbooks',930),
             ('secrets_policy','## Secret storage policy',920),
             ('environment','## Current environment / project facts',900),
+            ('projects','## Project profiles',890),
             ('task_outcomes','## Recent task outcomes',870),
+            ('source_policy','## Source ingestion policy',850),
             ('secrets','## Secret index matches (redacted)',840),
+            ('contradictions','## Open contradictions / uncertain facts',800),
             ('relations','## Entity graph relations',760),
             ('sessions','## Relevant recent sessions',720),
             ('other','## Other relevant facts',650),
@@ -2269,6 +2715,7 @@ class MemoryWikiProvider(MemoryProvider):
             if key not in seen:
                 seen.add(key); buckets.setdefault(bucket,[]).append((prio,label,short(text,700)))
         add('recall_plan','plan',json.dumps(plan,ensure_ascii=False),1000)
+        add('source_policy','current_query', json.dumps(source_policy_for('tool'), ensure_ascii=False), 850)
         for s in secrets:
             add('secrets','secret_index', f"`{s['id']}` {s['subject']} / {s['scope']} type={s['secret_type']} locator={s['locator']} purpose={s['purpose']}", 900)
         for r in rows:
@@ -2297,7 +2744,17 @@ class MemoryWikiProvider(MemoryProvider):
             add(bucket,'claim',line,int(float(r.get('score',0))*100))
         for rel in graph.get('relations',[]): add('relations','relation', f"{rel['subject']} -[{rel['predicate']}]-> {rel['object']} conf={rel['confidence']}", 700)
         try:
-            c=self._connect(); task_rows=c.execute("SELECT * FROM task_capsules ORDER BY created_at DESC LIMIT 40").fetchall()
+            c=self._connect()
+            profile_rows=c.execute("SELECT * FROM project_profiles ORDER BY updated_at DESC LIMIT 40").fetchall()
+            for p in profile_rows:
+                blob=' '.join(str(p[k]) for k in p.keys()).lower()
+                overlap=len(qtok & set(tokens(blob))) if qtok else 1
+                if qtok and overlap <= 0 and str(p['project_id']).lower() not in str(query or '').lower():
+                    continue
+                add('projects','project_profile', f"`{p['project_id']}` root={p['root']}; purpose={p['purpose']}; commands={p['commands']}; services={p['services']}; status={p['current_status'] if 'current_status' in p.keys() else ''}; notes={p['notes']}", 900 + overlap*40)
+            for k in c.execute("SELECT * FROM contradictions WHERE status='open' ORDER BY created_at DESC LIMIT 30").fetchall():
+                add('contradictions','contradiction', f"`{k['id']}` {k['claim_a']} ↔ {k['claim_b']}: {k['reason']} severity={k['severity'] if 'severity' in k.keys() else 'possible'}", 790)
+            task_rows=c.execute("SELECT * FROM task_capsules ORDER BY created_at DESC LIMIT 40").fetchall()
             sources['task_capsules']=len(task_rows)
             for t in task_rows:
                 blob=' '.join([str(t['intent']), str(t['topic']), str(t['plan']), str(t['files']), str(t['commands']), str(t['errors']), str(t['fixes']), str(t['verification']), str(t['followups'])])
@@ -2318,14 +2775,11 @@ class MemoryWikiProvider(MemoryProvider):
             header=title
             if used+len(header)+1>max_chars: break
             out.append(header); used+=len(header)+1
-            per_section = 8 if key in ('procedures','environment','other') else 5
-            added_in_section = 0
+            # Без жёсткого per-section бюджета: режем только общим max_chars, чтобы сильные секции не душились фиксированными квотами.
             for pr,label,text in items:
-                if added_in_section >= per_section:
-                    break
                 line=f"- [{label}] {text}"
                 if used+len(line)+1>max_chars: continue
-                out.append(line); used+=len(line)+1; chunk_count+=1; added_in_section+=1
+                out.append(line); used+=len(line)+1; chunk_count+=1
         context='\n'.join(out)
         refined=self._llm_pack_context(query, context, max_chars)
         if refined and not is_ephemeral_fragment(refined):
@@ -2383,7 +2837,7 @@ class MemoryWikiProvider(MemoryProvider):
     def _scrub_secrets(self, apply: bool=False, limit: int=200) -> Dict[str, Any]:
         """Redact raw secrets already stored in memory tables without surfacing them."""
         c=self._connect(); limit=max(1,min(int(limit or 200),1000)); hits=[]; updated=0; secret_refs=[]
-        targets=[('claims','id',['claim','evidence','source']),('evidence','id',['text','source']),('review_queue','id',['candidate','evidence','suggested_claim','reason']),('secret_index','id',['subject','scope','purpose','source'])]
+        targets=[('claims','id',['claim','evidence','source']),('evidence','id',['text','source']),('review_queue','id',['candidate','evidence','suggested_claim','reason']),('secret_index','id',['subject','scope','purpose','source']),('task_capsules','id',['intent','plan','files','commands','errors','fixes','verification','followups']),('entities','id',['name','aliases','notes']),('relations','id',['subject','object','evidence']),('project_profiles','project_id',['root','purpose','commands','services','notes','stack_json','current_status']),('post_task_log','id',['summary','changed_files','backups','verification','services'])]
         for table, pk, fields in targets:
             rows=c.execute(f"SELECT * FROM {table} LIMIT 5000").fetchall()
             for r in rows:
@@ -2473,7 +2927,7 @@ class MemoryWikiProvider(MemoryProvider):
     def _export(self, limit=200) -> Dict[str,Any]:
         c=self._connect(); limit=max(1,min(limit,2000))
         clean = self._sanitize_row
-        return {"success":True,"claims":[clean(r) for r in c.execute("SELECT * FROM claims ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()],"evidence":[clean(r) for r in c.execute("SELECT * FROM evidence ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"contradictions":[clean(r) for r in c.execute("SELECT * FROM contradictions ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"review_queue":[clean(r) for r in c.execute("SELECT * FROM review_queue ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()],"secret_quarantine":[clean(r) for r in c.execute("SELECT * FROM secret_quarantine ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"changes":[clean(r) for r in c.execute("SELECT * FROM memory_changes ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"audit":[clean(r) for r in c.execute("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()]}
+        return {"success":True,"claims":[clean(r) for r in c.execute("SELECT * FROM claims ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()],"evidence":[clean(r) for r in c.execute("SELECT * FROM evidence ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"contradictions":[clean(r) for r in c.execute("SELECT * FROM contradictions ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"review_queue":[clean(r) for r in c.execute("SELECT * FROM review_queue ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()],"secret_quarantine":[clean(r) for r in c.execute("SELECT * FROM secret_quarantine ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"changes":[clean(r) for r in c.execute("SELECT * FROM memory_changes ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"mutations":[clean(r) for r in c.execute("SELECT * FROM memory_mutations ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"project_profiles":[clean(r) for r in c.execute("SELECT * FROM project_profiles ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()],"entities":[clean(r) for r in c.execute("SELECT * FROM entities ORDER BY updated_at DESC LIMIT ?",(limit,)).fetchall()],"relations":[clean(r) for r in c.execute("SELECT * FROM relations ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"sync_bundles":[clean(r) for r in c.execute("SELECT * FROM sync_bundles ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()],"audit":[clean(r) for r in c.execute("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()]}
 
 
 def register(ctx) -> None:

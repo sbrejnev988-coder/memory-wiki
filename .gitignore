@@ -19,9 +19,12 @@ env/
 .vscode/
 *.swp
 *.swo
+*.tmp
+*.orig
 
 # Hermes / memory-wiki runtime data
 memory-wiki/
+.hermes/
 **/memory_wiki.sqlite3
 **/memory_wiki.sqlite3-*
 *.sqlite
@@ -43,11 +46,14 @@ sessions/
 logs/
 *.log
 *.bak
+*.bak_*
+*.bak-*
 *.backup
 *.zip
 *.tar
 *.tar.gz
 *.tgz
+*.age
 
 # Smoke-test temporary homes if created inside repo
 memorywiki_smoke_*/

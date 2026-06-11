@@ -93,28 +93,37 @@ def main() -> int:
             "memory_wiki_resolve_contradiction",
             "memory_wiki_merge_claims",
             "memory_wiki_pin_claim",
+            "memory_wiki_write_firewall",
+            "memory_wiki_mutation_log",
+            "memory_wiki_undo_last",
+            "memory_wiki_transaction",
+            "memory_wiki_compile_topic",
+            "memory_wiki_get_project_context",
+            "memory_wiki_source_policy",
+            "memory_wiki_export_bundle",
+            "memory_wiki_import_bundle",
         ]
         missing = [name for name in required if name not in schemas]
         assert not missing, {"missing_schemas": missing, "schemas": schemas}
 
-        secret_value = "example-placeholder-secret-for-redaction-test"
+        secret_value = "dummy-secret-value-should-not-leak"
         secret_result = call(
             "memory_wiki_add_secret",
             {
-                "subject": "Example Subject",
+                "subject": "Demo Server",
                 "scope": "VPS SSH",
                 "secret_type": "password",
-                "locator": "203.0.113.10/user",
+                "locator": "ssh://demo.example.invalid/user",
                 "value": secret_value,
                 "purpose": "test",
             },
         )
         assert secret_result.get("id"), secret_result
         assert_no_secret_leak(secret_result, secret_value, "add_secret response")
-        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Example Server", "limit": 5, "reveal": False})
+        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Demo Server", "limit": 5, "reveal": False})
         assert redacted_secrets.get("secrets"), redacted_secrets
         assert_no_secret_leak(redacted_secrets, secret_value, "redacted secret query")
-        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Example Server", "limit": 5, "reveal": True})
+        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Demo Server", "limit": 5, "reveal": True})
         assert secret_value in json.dumps(revealed_secrets, ensure_ascii=False), revealed_secrets
 
         alpha = call(
@@ -196,13 +205,34 @@ def main() -> int:
                 "verification": "ok",
             },
         )
-        call("memory_wiki_add_entity", {"name": "Example Server", "entity_type": "server", "aliases": ["example app server"]})
-        call("memory_wiki_add_relation", {"subject": "Example Server", "predicate": "hosts", "object": "ExampleApp", "evidence": "smoke"})
-        graph = call("memory_wiki_graph_query", {"query": "Example Subject", "limit": 10})
+        call("memory_wiki_add_entity", {"name": "Demo Server", "entity_type": "server", "aliases": ["agent server"]})
+        call("memory_wiki_add_relation", {"subject": "Demo Server", "predicate": "hosts", "object": "Agent Runtime", "evidence": "smoke"})
+        graph = call("memory_wiki_graph_query", {"query": "Demo", "limit": 10})
         assert graph.get("entities") or graph.get("relations"), graph
-        packed = call("memory_wiki_pack_context", {"query": "Example Subject ExampleApp secret", "max_chars": 2500})
+        packed = call("memory_wiki_pack_context", {"query": "Demo Agent secret", "max_chars": 2500})
         assert packed.get("context") is not None, packed
         assert_no_secret_leak(packed, secret_value, "packed context")
+
+        firewall = call("memory_wiki_write_firewall", {"claim": "Memory wiki smoke firewall stores clean structured context", "topic": "Smoke Topic", "source": "tool", "mode": "apply"})
+        assert firewall.get("claim_id") or firewall.get("review_id"), firewall
+        policy = call("memory_wiki_source_policy", {"source": "session_end:smoke", "claim": "previous turn was interrupted and tool output leaked", "topic": "Smoke Topic"})
+        assert policy.get("policy", {}).get("candidate_only") is True, policy
+        mutation_log = call("memory_wiki_mutation_log", {"limit": 20})
+        assert isinstance(mutation_log.get("events"), list), mutation_log
+        undo_dry = call("memory_wiki_undo_last", {"dry_run": True})
+        assert "found" in undo_dry, undo_dry
+        tx = call("memory_wiki_transaction", {"mode": "suggest", "operations": [{"operation": "memory_wiki_compile_topic", "args": {"topic": "Smoke Topic", "limit": 10}}], "reason": "smoke dry-run"})
+        assert tx.get("results"), tx
+        compiled = call("memory_wiki_compile_topic", {"topic": "Smoke Topic", "mode": "apply", "limit": 20, "summary_type": "summary"})
+        assert compiled.get("claim_id"), compiled
+        project_ctx = call("memory_wiki_get_project_context", {"project_id": "memory-wiki", "query": "smoke", "limit": 10})
+        assert project_ctx.get("profile"), project_ctx
+        bundle = call("memory_wiki_export_bundle", {"topic": "Smoke Topic", "limit": 30, "write_file": False})
+        assert bundle.get("payload", {}).get("claims") is not None, bundle
+        assert_no_secret_leak(bundle, secret_value, "sync bundle")
+        import_suggest = call("memory_wiki_import_bundle", {"payload": bundle["payload"], "mode": "suggest"})
+        assert import_suggest.get("would_import"), import_suggest
+
         snapshot = call("memory_wiki_snapshot", {"name": "smoke"})
         assert Path(snapshot.get("path", "")).exists(), snapshot
 
