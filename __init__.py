@@ -154,11 +154,15 @@ def slug(s: str, n: int = 80) -> str:
 
 def normalize_claim_status(status: str) -> str:
     """Normalize lifecycle status and quarantine unknown/corrupted values as uncertain."""
+    # A corrupted lifecycle value must not become a new dashboard bucket.
+    # `uncertain` keeps the row visible for review without treating it as active truth.
     s = slug(status or "active")
     return s if s in VALID_CLAIM_STATUSES else "uncertain"
 
 def topic_integrity_reason(topic: str) -> str:
     """Return a compact reason when a topic is not a safe canonical slug."""
+    # Topics become file names, dashboard groups and FTS filters; hidden control
+    # characters or generated junk must be detected even when SQLite is healthy.
     raw = str(topic or "")
     clean = slug(raw)
     if not raw.strip():
@@ -2934,6 +2938,8 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _repair_claim_metadata(self, dry_run: bool=True, limit: int=1000) -> Dict[str, Any]:
         """Heal corrupted lifecycle/topic metadata that breaks dashboards and recall hygiene."""
+        # This deliberately repairs metadata only, not claim text. Text cleanup remains
+        # a curation/rewrite job, while metadata repair is safe enough for integrity runs.
         c=self._connect(); fixes=[]; limit=max(1,min(int(limit or 1000),5000))
         rows=c.execute("SELECT id,claim,status,topic FROM claims ORDER BY updated_at DESC LIMIT 20000").fetchall()
         for r in rows:
