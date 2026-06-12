@@ -8,7 +8,7 @@ It is designed for long-running AI-agent installations where memory must be dura
 
 ## Current version
 
-`plugin.yaml`: **1.2.0**
+`plugin.yaml`: **1.2.1**
 
 Version 1.2 focuses on making memory-wiki behave like a real operational memory layer rather than a loose note store:
 
@@ -21,7 +21,23 @@ Version 1.2 focuses on making memory-wiki behave like a real operational memory 
 - retrieval-quality evaluation;
 - claim compiler/topic summarizer;
 - stronger secret firewall, quarantine and scrub tooling;
-- doctor/repair/self-healing workflows for SQLite/FTS/dashboard issues.
+- doctor/repair/self-healing workflows for SQLite/FTS/dashboard issues;
+- claim metadata integrity repair for corrupted lifecycle statuses and hidden control-character topics.
+
+## Release notes / maintainer comments
+
+### 1.2.1 — claim metadata integrity guard
+
+This release adds a focused self-healing layer for a subtle class of memory corruption: claim rows whose lifecycle `status` or `topic` metadata becomes invalid while the SQLite database itself still passes `PRAGMA quick_check`.
+
+Maintainer notes:
+
+- `memory_wiki_health` now reports `schema_anomalies` for invalid claim statuses and unsafe topic slugs.
+- `memory_wiki_doctor` checks `claim_status_values` and `claim_topic_values` in addition to schema, FTS, WAL and filesystem health.
+- `memory_wiki_repair target=integrity` includes a `repair_claim_metadata` dry-run/apply action.
+- Unknown statuses are normalized to `uncertain` instead of leaking into dashboard status counts.
+- Topics containing control characters or unsafe generated slugs are retopiced from the claim content.
+- The smoke suite injects a deliberately corrupted row and verifies that repair heals it.
 
 ## What it stores
 
@@ -74,7 +90,7 @@ and is ignored by this repository.
 
 ### Operations and recovery
 
-- SQLite `doctor`, `health`, `repair`, FTS rebuild and dashboard render checks.
+- SQLite `doctor`, `health`, `repair`, FTS rebuild, metadata integrity and dashboard render checks.
 - Full backup/list/restore helpers.
 - Human-readable snapshots.
 - Audit log and mutation log.
@@ -154,7 +170,7 @@ python3 -m py_compile __init__.py scripts/memory_wiki_cli.py scripts/smoke_test.
 MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
 ```
 
-The smoke test creates a temporary `$HERMES_HOME`, verifies registered tool schemas, dispatch parity and core memory operations, then removes the temporary home.
+The smoke test creates a temporary `$HERMES_HOME`, verifies registered tool schemas, dispatch parity, core memory operations and metadata self-healing, then removes the temporary home.
 
 To keep the temporary home for inspection:
 

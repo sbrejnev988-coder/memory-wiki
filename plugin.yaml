@@ -1,3 +1,3 @@
 name: memory-wiki
-version: 1.2.0
-description: Native Hermes active-memory wiki vault with SQLite FTS, write firewall/source policy, sectioned pack_context without fixed section budgets, mutation log/undo, transactional dry-run/apply batches, retrieval evaluation, claim compiler, typed graph/project context, secret firewall, provenance cards, redacted sync bundles, dashboards, recovery and self-healing tools.
+version: 1.2.1
+description: Native Hermes active-memory wiki vault with SQLite FTS, write firewall/source policy, sectioned pack_context without fixed section budgets, mutation log/undo, transactional dry-run/apply batches, retrieval evaluation, claim compiler, typed graph/project context, secret firewall, provenance cards, redacted sync bundles, dashboards, recovery, claim metadata integrity repair and self-healing tools.

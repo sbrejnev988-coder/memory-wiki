@@ -110,20 +110,20 @@ def main() -> int:
         secret_result = call(
             "memory_wiki_add_secret",
             {
-                "subject": "Demo Server",
+                "subject": "Rustem",
                 "scope": "VPS SSH",
                 "secret_type": "password",
-                "locator": "ssh://demo.example.invalid/user",
+                "locator": "1.2.3.4/user",
                 "value": secret_value,
                 "purpose": "test",
             },
         )
         assert secret_result.get("id"), secret_result
         assert_no_secret_leak(secret_result, secret_value, "add_secret response")
-        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Demo Server", "limit": 5, "reveal": False})
+        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Rustem VPS", "limit": 5, "reveal": False})
         assert redacted_secrets.get("secrets"), redacted_secrets
         assert_no_secret_leak(redacted_secrets, secret_value, "redacted secret query")
-        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Demo Server", "limit": 5, "reveal": True})
+        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Rustem VPS", "limit": 5, "reveal": True})
         assert secret_value in json.dumps(revealed_secrets, ensure_ascii=False), revealed_secrets
 
         alpha = call(
@@ -205,11 +205,11 @@ def main() -> int:
                 "verification": "ok",
             },
         )
-        call("memory_wiki_add_entity", {"name": "Demo Server", "entity_type": "server", "aliases": ["agent server"]})
-        call("memory_wiki_add_relation", {"subject": "Demo Server", "predicate": "hosts", "object": "Agent Runtime", "evidence": "smoke"})
-        graph = call("memory_wiki_graph_query", {"query": "Demo", "limit": 10})
+        call("memory_wiki_add_entity", {"name": "Rustem VPS", "entity_type": "server", "aliases": ["openclaw server"]})
+        call("memory_wiki_add_relation", {"subject": "Rustem VPS", "predicate": "hosts", "object": "OpenClaw", "evidence": "smoke"})
+        graph = call("memory_wiki_graph_query", {"query": "Rustem", "limit": 10})
         assert graph.get("entities") or graph.get("relations"), graph
-        packed = call("memory_wiki_pack_context", {"query": "Demo Agent secret", "max_chars": 2500})
+        packed = call("memory_wiki_pack_context", {"query": "Rustem OpenClaw secret", "max_chars": 2500})
         assert packed.get("context") is not None, packed
         assert_no_secret_leak(packed, secret_value, "packed context")
 
@@ -240,8 +240,22 @@ def main() -> int:
         assert "counts" in dashboard, dashboard
         page = call("memory_wiki_get_page", {"topic": "smoke-topic"})
         assert page.get("content"), page
+        # Вставляем искусственно повреждённые metadata, чтобы self-healing ловил битые статусы/топики.
+        bad_claim = "Memory wiki smoke corrupted metadata row should be healed"
+        bad_id = "c_smoke_badmeta"
+        ts = mod.now()
+        with provider._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO claims(id,claim,topic,status,confidence,source,evidence,created_at,updated_at,freshness_at,hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (bad_id, bad_claim, "\x04bad-topic", "broken_status", 0.7, "smoke", "", ts, ts, ts, mod.sha(bad_claim.lower())),
+            )
         health = call("memory_wiki_health", {"limit": 20})
-        assert "issues" in health, health
+        assert "issues" in health and health.get("schema_anomalies"), health
+        repair_meta = call("memory_wiki_repair", {"target": "integrity", "dry_run": False})
+        meta_action = next((a for a in repair_meta.get("actions", []) if a.get("action") == "repair_claim_metadata"), {})
+        assert meta_action.get("fix_count", 0) >= 1, repair_meta
+        healed = provider._connect().execute("SELECT status,topic FROM claims WHERE id=?", (bad_id,)).fetchone()
+        assert healed["status"] == "uncertain" and "\x04" not in healed["topic"], dict(healed)
         recent = call("memory_wiki_recent_changes", {"since_seconds": 3600, "limit": 20})
         assert isinstance(recent.get("changes"), list), recent
 

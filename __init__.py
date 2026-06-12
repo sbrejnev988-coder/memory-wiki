@@ -1,4 +1,4 @@
-"""memory-wiki v1.2.0: native Hermes active-memory wiki vault.
+"""memory-wiki v1.2.1: native Hermes active-memory wiki vault.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki. Runs inside MemoryProvider lifecycle, so recall is
@@ -63,9 +63,9 @@ MAX_RENDER_TOPICS = 250
 MIN_AUTO_INGEST_SCORE = 2
 MIN_EXPLICIT_INGEST_SCORE = 1
 CANONICAL_TOPICS = {
-    "preferences", "hermes", "memory-wiki", "server", "android", "agent-runtime", "proxy", "api", "telegram",
+    "preferences", "hermes", "memory-wiki", "server", "android", "openclaw", "proxy", "api", "telegram",
     "config", "database", "github", "project-scoping", "secrets", "projects", "tasks", "lessons", "decisions",
-    "operations", "bridge", "trading", "product", "smoke", "general",
+    "operations", "bridge", "ibkr-zorro", "heart", "smoke", "general",
 }
 FORBIDDEN_AUTO_TOPICS = {
     "curl", "post", "get", "put", "patch", "delete", "noop", "test", "tests", "тест", "возвращает",
@@ -75,6 +75,8 @@ BAD_TOPICS = {
     "general", "root", "example", "начал", "рамках", "19000", "пользователь", "assistant", "user",
     "500", "523", "256000", "9000", "192", "127", "места", *FORBIDDEN_AUTO_TOPICS,
 }
+VALID_CLAIM_STATUSES = {"active", "retired", "superseded", "uncertain"}
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 TOPIC_ALIASES = {
     "memory": "hermes", "память": "hermes", "плагин": "hermes", "plugins": "hermes",
     "sqlite3": "database", "db": "database", "бд": "database",
@@ -102,7 +104,7 @@ SECRET_PATTERNS = [
     # `key=value` assignments.  Redact those before any recall/export.
     (re.compile(r"(?is)((?:password|passwd|pass|пароль)[\s\S]{0,240}?```(?:text|bash|sh)?\s*)((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(\s*```)") , r"\1<PASSWORD_REDACTED>\3"),
     (re.compile(r"(?i)\b(password|passwd|pass|пароль)\s+(?!(?:auth(?:entication)?|disabled|enabled|login|logins|mode|modes|field|fields|value|values|manager|protected|vault|entry|entries|ssh|path|policy|required|only|is|are|was|were|есть|нет|доступ|аутентификация)\b)([A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <PASSWORD_REDACTED>"),
-    (re.compile(r"(?i)\b(root|admin|administrator|service|user)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
+    (re.compile(r"(?i)\b(root|Hermesusclaw|Hermes|madmax|xiaomi)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
     (re.compile(r"\b(?:sk|rk|pk|ak)-[A-Za-z0-9_\-]{16,}\b"), "<API_KEY_REDACTED>"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "<GITHUB_TOKEN_REDACTED>"),
     (re.compile(r"\bglpat-[A-Za-z0-9_\-]{16,}\b"), "<GITLAB_TOKEN_REDACTED>"),
@@ -149,6 +151,26 @@ def short(s: str, n: int = 240) -> str:
 def slug(s: str, n: int = 80) -> str:
     s = re.sub(r"[^\wА-Яа-яЁё-]+", "-", str(s or "").lower(), flags=re.UNICODE).strip("-")
     return (s[:n].strip("-") or "general")
+
+def normalize_claim_status(status: str) -> str:
+    """Normalize lifecycle status and quarantine unknown/corrupted values as uncertain."""
+    s = slug(status or "active")
+    return s if s in VALID_CLAIM_STATUSES else "uncertain"
+
+def topic_integrity_reason(topic: str) -> str:
+    """Return a compact reason when a topic is not a safe canonical slug."""
+    raw = str(topic or "")
+    clean = slug(raw)
+    if not raw.strip():
+        return "empty topic"
+    if CONTROL_CHAR_RE.search(raw):
+        return "control characters in topic"
+    if raw.strip().lower() != clean:
+        return "non-slug topic"
+    if (clean in BAD_TOPICS or clean.isdigit() or len(clean) < 3) and clean not in CANONICAL_TOPICS:
+        return "bad/generated topic"
+    return ""
+
 def tokens(s: str) -> set[str]: return {w.group(0).lower() for w in WORD_RE.finditer(s or "") if w.group(0).lower() not in STOP}
 def age_days(ts: int) -> float: return max(0.0, (now() - int(ts or 0)) / 86400.0)
 def clamp(x: float, lo=0.0, hi=1.0) -> float: return max(lo, min(hi, x))
@@ -1556,9 +1578,13 @@ class MemoryWikiProvider(MemoryProvider):
         cid = a.get("claim_id") or ""; c = self._connect(); row = c.execute("SELECT * FROM claims WHERE id=?", (cid,)).fetchone()
         if not row: raise ValueError(f"claim not found: {cid}")
         fields=[]; vals=[]
-        new_topic = slug(a.get("topic") or row["topic"])
+        new_topic = self._topic_alias(a.get("topic") or row["topic"], a.get("claim") or row["claim"])
         for k in ("claim","topic","status"):
-            if a.get(k) is not None: fields.append(f"{k}=?"); vals.append(slug(a[k]) if k=="topic" else normalize_claim(a[k]))
+            if a.get(k) is not None:
+                fields.append(f"{k}=?")
+                if k == "topic": vals.append(self._topic_alias(a[k], a.get("claim") or row["claim"]))
+                elif k == "status": vals.append(normalize_claim_status(a[k]))
+                else: vals.append(normalize_claim(a[k]))
         if a.get("claim") is not None:
             new_claim = normalize_claim(a.get("claim"))
             fields.append("normalized_claim=?"); vals.append(new_claim)
@@ -1940,11 +1966,11 @@ class MemoryWikiProvider(MemoryProvider):
         with c:
             for r in payload.get("claims", []) or []:
                 if not r.get("id") or not r.get("claim"): continue
-                clean_claim=short(redact_secrets(r.get("claim","")),1400); clean_topic=slug(r.get("topic") or self._infer_topic(clean_claim) or "general"); clean_ev=short(redact_secrets(r.get("evidence","")),2500)
+                clean_claim=short(redact_secrets(r.get("claim","")),1400); clean_topic=self._topic_alias(r.get("topic") or self._infer_topic(clean_claim) or "general", clean_claim); clean_status=normalize_claim_status(r.get("status") or "active"); clean_ev=short(redact_secrets(r.get("evidence","")),2500)
                 c.execute("""INSERT INTO claims(id,hash,claim,topic,evidence,status,confidence,salience,freshness_at,created_at,updated_at,access_count,last_accessed,quality,pinned)
                              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                              ON CONFLICT(id) DO UPDATE SET claim=excluded.claim,topic=excluded.topic,evidence=excluded.evidence,status=excluded.status,confidence=excluded.confidence,salience=excluded.salience,freshness_at=excluded.freshness_at,updated_at=excluded.updated_at,quality=excluded.quality,pinned=max(pinned,excluded.pinned)""",
-                          (r["id"], r.get("hash") or sha(clean_claim.lower()), clean_claim, clean_topic, clean_ev, r.get("status") or "active", clamp(float(r.get("confidence",.75))), clamp(float(r.get("salience",.7))), int(r.get("freshness_at") or now()), int(r.get("created_at") or now()), int(r.get("updated_at") or now()), int(r.get("access_count") or 0), int(r.get("last_accessed") or 0), clamp(float(r.get("quality", claim_quality(clean_claim, clean_topic)))), int(r.get("pinned") or (PIN_MARKER in clean_claim.lower()) or 0)))
+                          (r["id"], r.get("hash") or sha(clean_claim.lower()), clean_claim, clean_topic, clean_ev, clean_status, clamp(float(r.get("confidence",.75))), clamp(float(r.get("salience",.7))), int(r.get("freshness_at") or now()), int(r.get("created_at") or now()), int(r.get("updated_at") or now()), int(r.get("access_count") or 0), int(r.get("last_accessed") or 0), clamp(float(r.get("quality", claim_quality(clean_claim, clean_topic)))), int(r.get("pinned") or (PIN_MARKER in clean_claim.lower()) or 0)))
                 ci+=1
             for e in payload.get("evidence", []) or []:
                 if not e.get("claim_id") or not e.get("text"): continue
@@ -2012,7 +2038,7 @@ class MemoryWikiProvider(MemoryProvider):
         top=[dict(r) for r in c.execute("SELECT id,topic,claim,confidence,salience,quality,pinned,access_count FROM claims WHERE status='active' ORDER BY salience DESC, confidence DESC LIMIT ?",(limit,)).fetchall()]
         has_review_queue = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_queue'").fetchone() is not None
         review_pending = c.execute("SELECT count(*) n FROM review_queue WHERE status='pending'").fetchone()["n"] if has_review_queue else 0
-        return {"success":True,"version":"1.1.0","root":str(self.root),"db":str(self.db_path),"counts":counts,"topics":topics,"top_claims":top,"stale":stale,"contradictions":contr,"review_pending":review_pending,"dashboard":str(self.dashboard_dir/"index.md")}
+        return {"success":True,"version":"1.2.1","root":str(self.root),"db":str(self.db_path),"counts":counts,"topics":topics,"top_claims":top,"stale":stale,"contradictions":contr,"review_pending":review_pending,"dashboard":str(self.dashboard_dir/"index.md")}
 
     def _render_dashboards(self) -> None:
         d=self._dashboard(40); lines=["# Memory-Wiki Dashboard","",f"Updated: {time.strftime('%Y-%m-%d %H:%M:%S')}","",f"Vault: `{self.root}`","","## Counts"]
@@ -2046,7 +2072,17 @@ class MemoryWikiProvider(MemoryProvider):
         c = self._connect(); limit=max(1,min(limit,1000)); cols=set(self._cols("claims"))
         required={"normalized_claim","type","source_type","last_verified_at","verification_status","quality_flags","source_ref","derived_from","review_state"}
         issues=[]; metrics={"claims": c.execute("SELECT count(*) n FROM claims").fetchone()["n"], "schema_missing": sorted(required-cols)}
-        bad=[]; topics=[]; blobs=[]; secrets=[]
+        bad=[]; topics=[]; blobs=[]; secrets=[]; schema_anomalies=[]
+        # Metadata corruption is often old and low-salience, so scan the full bounded table
+        # instead of only the freshest rows; output remains capped by `limit`.
+        for r in c.execute("SELECT id,status,topic,claim FROM claims ORDER BY updated_at DESC LIMIT 20000").fetchall():
+            status = str(r["status"] or "")
+            if status not in VALID_CLAIM_STATUSES and len(schema_anomalies) < limit:
+                schema_anomalies.append({"id":r["id"],"field":"status","value":short(status,80),"suggested":"uncertain","claim":short(r["claim"],180)})
+            topic_reason = topic_integrity_reason(r["topic"])
+            if topic_reason and len(schema_anomalies) < limit:
+                suggested = "config" if str(r["claim"] or "").lower().startswith("hermes env/config metadata") else self._infer_topic(r["claim"])
+                schema_anomalies.append({"id":r["id"],"field":"topic","value":short(r["topic"],80),"suggested":suggested,"reason":topic_reason,"claim":short(r["claim"],180)})
         for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY updated_at DESC LIMIT ?", (max(limit*10, limit),)).fetchall():
             q = claim_quality(r["claim"], r["topic"]); bad_frag, why = is_bad_claim_fragment(r["claim"])
             if r["id"].startswith("c_summary_"):
@@ -2062,8 +2098,9 @@ class MemoryWikiProvider(MemoryProvider):
                 blobs.append({"id":r["id"],"topic":r["topic"],"claim":short(r["claim"],240),"reason":"system/tool artifact"})
             if (redact_secrets(r["claim"]) != r["claim"] or redact_secrets(str(r["evidence"] or "")) != str(r["evidence"] or "")) and len(secrets) < limit:
                 secrets.append({"id":r["id"],"topic":r["topic"],"claim":short(redact_secrets(r["claim"]),240)})
-        metrics.update({"low_quality":len(bad),"bad_topics":len(topics),"raw_blobs":len(blobs),"secret_hits":len(secrets)})
+        metrics.update({"low_quality":len(bad),"bad_topics":len(topics),"raw_blobs":len(blobs),"secret_hits":len(secrets),"schema_anomalies":len(schema_anomalies)})
         if metrics["schema_missing"]: issues.append("schema migration incomplete")
+        if schema_anomalies: issues.append("claim metadata anomalies need integrity repair")
         if bad: issues.append("low-quality/fragment claims need curation")
         if topics: issues.append("bad topics need retopic")
         if blobs: issues.append("raw logs/json blobs should be summarized or retired")
@@ -2078,7 +2115,7 @@ class MemoryWikiProvider(MemoryProvider):
         except Exception:
             eval_score = 0.75
         components={
-            'db_health': 0.0 if metrics['schema_missing'] else 1.0,
+            'db_health': 0.0 if metrics['schema_missing'] else (1.0 - min(1.0, len(schema_anomalies)*0.10)),
             'secret_health': 1.0 - min(1.0, len(secrets)*0.10),
             'semantic_quality': 1.0 - min(1.0, len(bad)*0.03 + len(topics)*0.02 + len(blobs)*0.04),
             'artifact_pollution': 1.0 - min(1.0, top_artifacts*0.06),
@@ -2087,7 +2124,7 @@ class MemoryWikiProvider(MemoryProvider):
         }
         metrics.update({'top_artifacts':top_artifacts,'health_components':components})
         score = sum(components.values()) / max(1, len(components))
-        return {"version":"1.2.0-memory-os","health_score":round(score,3),"metrics":metrics,"issues":issues,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
+        return {"version":"1.2.1-memory-os","health_score":round(score,3),"metrics":metrics,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
 
     def _explain_recall(self, query: str, limit: int = 10, topic: Optional[str]=None) -> List[Dict[str, Any]]:
         rows = self._search(query, limit, True, topic); qt=tokens(query); out=[]
@@ -2231,6 +2268,14 @@ class MemoryWikiProvider(MemoryProvider):
             n=c.execute('SELECT count(*) n FROM claims').fetchone()['n']; add('claims_count', True, str(n))
         except Exception as e: add('claims_count', False, str(e), 'memory_wiki_repair target=integrity dry_run=false')
         try:
+            invalid_status=c.execute("SELECT count(*) n FROM claims WHERE status NOT IN ('active','retired','superseded','uncertain')").fetchone()['n']
+            bad_topic_count=0
+            for r in c.execute("SELECT topic FROM claims LIMIT 10000").fetchall():
+                if topic_integrity_reason(r['topic']): bad_topic_count += 1
+            add('claim_status_values', invalid_status==0, f'invalid={invalid_status}', 'memory_wiki_repair target=integrity dry_run=false')
+            add('claim_topic_values', bad_topic_count==0, f'anomalies={bad_topic_count}', 'memory_wiki_repair target=integrity dry_run=false')
+        except Exception as e: add('claim_metadata_values', False, str(e), 'memory_wiki_repair target=integrity dry_run=false')
+        try:
             fts_exists='claims_fts' in existing
             if fts_exists:
                 cn=c.execute('SELECT count(*) n FROM claims').fetchone()['n']; fn=c.execute('SELECT count(*) n FROM claims_fts').fetchone()['n']
@@ -2280,7 +2325,7 @@ class MemoryWikiProvider(MemoryProvider):
                             if not f.is_file() or f.is_symlink(): continue
                             arc=str(f.resolve().relative_to(self.root.resolve()))
                             if zip_member_safe(arc): z.write(f, arc); written.append(arc)
-                z.writestr('backup_meta.json', json.dumps({'id':bid,'reason':reason,'created_at':now(),'version':'1.1.0','files':len(written)}, ensure_ascii=False, indent=2))
+                z.writestr('backup_meta.json', json.dumps({'id':bid,'reason':reason,'created_at':now(),'version':'1.2.1','files':len(written)}, ensure_ascii=False, indent=2))
             os.replace(tmp_path, path)
         finally:
             try:
@@ -2887,13 +2932,46 @@ class MemoryWikiProvider(MemoryProvider):
             self._rebuild_fts(); self._render_active_dashboard(); self._audit('scrub_secrets','ok',f'hits={len(hits)} updated={updated}')
         return {'applied':apply,'hits':hits,'hit_count':len(hits),'updated_rows':updated,'secret_refs':sorted(set(secret_refs))[:100]}
 
+    def _repair_claim_metadata(self, dry_run: bool=True, limit: int=1000) -> Dict[str, Any]:
+        """Heal corrupted lifecycle/topic metadata that breaks dashboards and recall hygiene."""
+        c=self._connect(); fixes=[]; limit=max(1,min(int(limit or 1000),5000))
+        rows=c.execute("SELECT id,claim,status,topic FROM claims ORDER BY updated_at DESC LIMIT 20000").fetchall()
+        for r in rows:
+            old_status=str(r['status'] or '')
+            old_topic=str(r['topic'] or '')
+            new_status=normalize_claim_status(old_status)
+            new_topic=old_topic
+            topic_reason=topic_integrity_reason(old_topic)
+            if topic_reason:
+                claim_low=str(r['claim'] or '').lower()
+                if claim_low.startswith('hermes env/config metadata') or 'configured variables' in claim_low:
+                    new_topic='config'
+                else:
+                    new_topic=self._topic_alias(self._infer_topic(r['claim']), r['claim'])
+            if new_status != old_status or new_topic != old_topic:
+                fixes.append({'id':r['id'], 'old_status':old_status, 'new_status':new_status, 'old_topic':old_topic, 'new_topic':new_topic, 'topic_reason':topic_reason})
+                if len(fixes) >= limit:
+                    break
+        if not dry_run and fixes:
+            ts=now()
+            with c:
+                for f in fixes:
+                    c.execute('UPDATE claims SET status=?, topic=?, updated_at=?, quality=max(quality, ?) WHERE id=?', (f['new_status'], f['new_topic'], ts, claim_quality(c.execute('SELECT claim FROM claims WHERE id=?',(f['id'],)).fetchone()['claim'], f['new_topic']), f['id']))
+                    self._add_change('repair_claim_metadata', f['id'], f"status {f['old_status']} -> {f['new_status']}; topic {f['old_topic']} -> {f['new_topic']}")
+            self._rebuild_fts(); self._render_all()
+        return {'fix_count':len(fixes), 'fixes':fixes[:50]}
+
     def _repair(self, target: str='all', dry_run: bool=True) -> Dict[str, Any]:
         target=(target or 'all').lower(); actions=[]
-        def act(name, fn=None):
-            actions.append({'action':name,'applied':not dry_run})
-            if not dry_run and fn: fn()
+        def act(name, fn=None, run_when_dry=False):
+            entry={'action':name,'applied':not dry_run}
+            if fn and (run_when_dry or not dry_run):
+                result=fn()
+                if isinstance(result, dict): entry.update(result)
+            actions.append(entry)
         if target in ('all','integrity'):
             act('migrate_schema', self._migrate)
+            act('repair_claim_metadata', lambda: self._repair_claim_metadata(dry_run), run_when_dry=True)
         if target in ('all','fts'):
             act('rebuild_claims_fts', self._rebuild_fts)
         if target in ('all','dashboards'):
