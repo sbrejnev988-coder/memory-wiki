@@ -87,6 +87,9 @@ def main() -> int:
             "memory_wiki_add_relation",
             "memory_wiki_graph_query",
             "memory_wiki_pack_context",
+            "memory_wiki_memory_diff",
+            "memory_wiki_preference_layer",
+            "memory_wiki_add_preference_rule",
             "memory_wiki_snapshot",
             "memory_wiki_review_queue",
             "memory_wiki_contradict",
@@ -106,11 +109,11 @@ def main() -> int:
         missing = [name for name in required if name not in schemas]
         assert not missing, {"missing_schemas": missing, "schemas": schemas}
 
-        secret_value = "dummy-secret-value-should-not-leak"
+        secret_value = "smoke-redaction-sentinel-should-not-leak"
         secret_result = call(
             "memory_wiki_add_secret",
             {
-                "subject": "Rustem",
+                "subject": "Demo User",
                 "scope": "VPS SSH",
                 "secret_type": "password",
                 "locator": "1.2.3.4/user",
@@ -120,10 +123,10 @@ def main() -> int:
         )
         assert secret_result.get("id"), secret_result
         assert_no_secret_leak(secret_result, secret_value, "add_secret response")
-        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Rustem VPS", "limit": 5, "reveal": False})
+        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Demo VPS", "limit": 5, "reveal": False})
         assert redacted_secrets.get("secrets"), redacted_secrets
         assert_no_secret_leak(redacted_secrets, secret_value, "redacted secret query")
-        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Rustem VPS", "limit": 5, "reveal": True})
+        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Demo VPS", "limit": 5, "reveal": True})
         assert secret_value in json.dumps(revealed_secrets, ensure_ascii=False), revealed_secrets
 
         alpha = call(
@@ -205,13 +208,20 @@ def main() -> int:
                 "verification": "ok",
             },
         )
-        call("memory_wiki_add_entity", {"name": "Rustem VPS", "entity_type": "server", "aliases": ["openclaw server"]})
-        call("memory_wiki_add_relation", {"subject": "Rustem VPS", "predicate": "hosts", "object": "OpenClaw", "evidence": "smoke"})
-        graph = call("memory_wiki_graph_query", {"query": "Rustem", "limit": 10})
+        call("memory_wiki_add_entity", {"name": "Demo VPS", "entity_type": "server", "aliases": ["demo app server"]})
+        call("memory_wiki_add_relation", {"subject": "Demo VPS", "predicate": "hosts", "object": "DemoApp", "evidence": "smoke"})
+        graph = call("memory_wiki_graph_query", {"query": "Demo User", "limit": 10})
         assert graph.get("entities") or graph.get("relations"), graph
-        packed = call("memory_wiki_pack_context", {"query": "Rustem OpenClaw secret", "max_chars": 2500})
+        packed = call("memory_wiki_pack_context", {"query": "Demo User DemoApp secret", "max_chars": 2500})
         assert packed.get("context") is not None, packed
         assert_no_secret_leak(packed, secret_value, "packed context")
+
+        memory_diff = call("memory_wiki_memory_diff", {"query": "Demo User DemoApp", "verified_facts": ["Demo VPS hosts DemoApp"], "limit": 8})
+        assert memory_diff.get("remembered") is not None and "answer_basis" in memory_diff, memory_diff
+        pref_rule = call("memory_wiki_add_preference_rule", {"rule": "Current explicit user instruction overrides durable memory during smoke", "priority": 990, "scope": "smoke", "source": "smoke"})
+        assert pref_rule.get("id", "").startswith("pref_") or pref_rule.get("id", "").startswith("pref"), pref_rule
+        pref_layer = call("memory_wiki_preference_layer", {"query": "instruction overrides memory", "limit": 10})
+        assert pref_layer.get("policy_order") and pref_layer.get("items") is not None, pref_layer
 
         firewall = call("memory_wiki_write_firewall", {"claim": "Memory wiki smoke firewall stores clean structured context", "topic": "Smoke Topic", "source": "tool", "mode": "apply"})
         assert firewall.get("claim_id") or firewall.get("review_id"), firewall

@@ -1,55 +1,40 @@
-# memory-wiki
+# hermes-memory-wiki
 
-**memory-wiki** is a source-only Hermes Agent plugin that turns assistant memory into a local, inspectable **Memory OS**: a SQLite + Markdown wiki vault with ranked recall, evidence, provenance, redaction, curation, recovery, transactions and operational dashboards.
+**hermes-memory-wiki** is a source-only Hermes Agent plugin that turns assistant memory into a local, inspectable **Memory OS**: a SQLite + Markdown wiki vault with ranked recall, evidence, provenance, redaction, curation, project profiles, graph relations, transactions, recovery tools and operational dashboards.
 
-It is designed for long-running AI-agent installations where memory must be durable, searchable, auditable and safe to maintain over months of work.
+It is designed for long-running AI-agent installations where memory must be durable, searchable, auditable, rollbackable and safe to maintain over months of work.
 
 > This public repository contains only plugin source, metadata and helper scripts. It intentionally excludes runtime databases, user memory, secrets, sessions, logs, snapshots, backups, vault files and other local artifacts.
 
 ## Current version
 
-`plugin.yaml`: **1.2.1**
+`plugin.yaml`: **1.3.0**
 
-Version 1.2 focuses on making memory-wiki behave like a real operational memory layer rather than a loose note store:
+Version 1.3 turns memory-wiki into a stronger Memory OS layer:
 
-- write firewall and source policy checks before durable writes;
-- sectioned `pack_context` without rigid per-section budgets;
-- mutation log, undo and transactional batch operations;
-- typed project/graph context;
-- provenance cards and `why_believe` inspection;
-- redacted sync bundles for cross-profile/import workflows;
-- retrieval-quality evaluation;
-- claim compiler/topic summarizer;
-- stronger secret firewall, quarantine and scrub tooling;
-- doctor/repair/self-healing workflows for SQLite/FTS/dashboard issues;
-- claim metadata integrity repair for corrupted lifecycle statuses and hidden control-character topics.
-
-## Release notes / maintainer comments
-
-### 1.2.1 — claim metadata integrity guard
-
-This release adds a focused self-healing layer for a subtle class of memory corruption: claim rows whose lifecycle `status` or `topic` metadata becomes invalid while the SQLite database itself still passes `PRAGMA quick_check`.
-
-Maintainer notes:
-
-- `memory_wiki_health` now reports `schema_anomalies` for invalid claim statuses and unsafe topic slugs.
-- `memory_wiki_doctor` checks `claim_status_values` and `claim_topic_values` in addition to schema, FTS, WAL and filesystem health.
-- `memory_wiki_repair target=integrity` includes a `repair_claim_metadata` dry-run/apply action.
-- Unknown statuses are normalized to `uncertain` instead of leaking into dashboard status counts.
-- Topics containing control characters or unsafe generated slugs are retopiced from the claim content.
-- The smoke suite injects a deliberately corrupted row and verifies that repair heals it.
+- **Memory Diff Before Answer** via `memory_wiki_memory_diff`: compare recalled memory against verified/current facts before answering.
+- **Write Firewall 2.0** via `memory_wiki_write_firewall`: source policy, quality linting, artifact detection and secret screening before durable writes.
+- **Project Autobiography** via first-class `project_profiles` and `memory_wiki_get_project_context`.
+- **Mutation Log + Undo** via `memory_wiki_mutation_log`, `memory_wiki_undo_last` and transactional batch operations.
+- **Policy-based contradiction resolution** via `memory_wiki_resolve_by_policy`.
+- **Recall unit tests** via `memory_wiki_evaluate_retrieval` golden queries.
+- **Sectioned context packing** via `memory_wiki_pack_context`, now including memory-diff and preference-priority sections.
+- **Graph Memory** via `memory_wiki_add_entity`, `memory_wiki_add_relation` and `memory_wiki_graph_query`.
+- **Provenance cards** via `memory_wiki_why_believe`.
+- **Preference Priority Layer** via `preference_rules`, `memory_wiki_preference_layer` and `memory_wiki_add_preference_rule`.
 
 ## What it stores
 
 memory-wiki stores structured operational memory, including:
 
-- claims/facts with confidence, salience, freshness, trust and access counts;
+- claims/facts with confidence, salience, freshness, trust, quality and access counts;
 - evidence and provenance for claims;
 - decisions, mistakes/lessons and user corrections;
 - project profiles and task capsules;
 - typed entity graph relations;
 - redacted secret index metadata;
 - review queues, lint results and curation actions;
+- preference-priority rules;
 - audit logs, mutation logs and maintenance reports.
 
 Runtime data is stored under:
@@ -67,6 +52,7 @@ and is ignored by this repository.
 - FTS5-backed search over active memory.
 - Freshness/salience/confidence/trust ranking.
 - Budget-aware `memory_wiki_pack_context` for injecting relevant context into agent turns.
+- Sectioned context with preferences, procedures, projects, task outcomes, graph relations, contradictions, memory diff and source-policy metadata.
 - Recall explanations for debugging why a claim was selected.
 - Feedback loop via `memory_wiki_mark_used`.
 
@@ -78,6 +64,7 @@ and is ignored by this repository.
 - Deduplication, vacuum and merge tools.
 - Contradiction recording, policy-based resolution and manual resolution.
 - Synthetic topic compression and curated topic compilation.
+- Golden-query retrieval evaluation.
 
 ### Safety and redaction
 
@@ -87,6 +74,7 @@ and is ignored by this repository.
 - Secret quarantine and scrub workflows.
 - Source policy and write firewall before durable writes.
 - Redacted export/import bundles for sync.
+- Last-mile public row sanitizer for query/export/graph surfaces.
 
 ### Operations and recovery
 
@@ -119,191 +107,78 @@ and is ignored by this repository.
 
 The plugin itself uses the Python standard library only.
 
-## Installation in Hermes
+## Install in Hermes
 
-Clone this repository into your Hermes plugins directory:
+Clone or copy this plugin into a Hermes profile:
 
 ```bash
-cd ~/.hermes/plugins
-git clone https://github.com/sbrejnev988-coder/memory-wiki.git memory-wiki
+mkdir -p ~/.hermes/plugins
+# Example path after clone/copy:
+# ~/.hermes/plugins/memory-wiki/
 ```
 
-Enable the plugin in your Hermes config:
+Enable it in `~/.hermes/config.yaml`:
 
 ```yaml
+memory:
+  provider: memory-wiki
+
 plugins:
   enabled:
     - memory-wiki
-
-memory:
-  provider: memory-wiki
 ```
 
-Then restart/reload Hermes so the plugin registry is rebuilt.
+Restart Hermes after editing plugin/config files so the plugin registry and provider instance reload.
 
-## Standalone CLI
+## Verification
 
-The helper CLI loads the provider directly and is useful for local maintenance or debugging outside a running Hermes process:
+Run syntax checks:
 
 ```bash
-python3 scripts/memory_wiki_cli.py --home ~/.hermes dashboard
-python3 scripts/memory_wiki_cli.py --home ~/.hermes query "project configuration" --limit 10
-python3 scripts/memory_wiki_cli.py --home ~/.hermes pack "what context is relevant for this task" --max-chars 3800
-python3 scripts/memory_wiki_cli.py --home ~/.hermes doctor
-python3 scripts/memory_wiki_cli.py --home ~/.hermes repair --target fts --apply
-python3 scripts/memory_wiki_cli.py --home ~/.hermes backup --reason manual
+python3 -m py_compile __init__.py scripts/smoke_test.py
 ```
 
-Use an isolated home for testing:
+Run the smoke suite with optional LLM refinement disabled:
 
 ```bash
-tmp_home=$(mktemp -d)
-python3 scripts/memory_wiki_cli.py --home "$tmp_home" dashboard
-```
-
-## Smoke tests
-
-Run syntax checks and the full smoke suite:
-
-```bash
-python3 -m py_compile __init__.py scripts/memory_wiki_cli.py scripts/smoke_test.py
 MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
 ```
 
-The smoke test creates a temporary `$HERMES_HOME`, verifies registered tool schemas, dispatch parity, core memory operations and metadata self-healing, then removes the temporary home.
+Expected output includes:
 
-To keep the temporary home for inspection:
-
-```bash
-MEMORY_WIKI_KEEP_SMOKE_HOME=1 MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
+```json
+{
+  "ok": true,
+  "schemas": 64
+}
 ```
 
-## Main Hermes tools
+## Main tool surface
 
-The plugin exposes 60+ `memory_wiki_*` tools. Major groups:
+The plugin exposes tools for:
 
-### Query and recall
+- claims: `memory_wiki_query`, `memory_wiki_add_claim`, `memory_wiki_update_claim`, `memory_wiki_rewrite_claim`, `memory_wiki_merge_claims`, `memory_wiki_pin_claim`;
+- evidence/provenance: `memory_wiki_add_evidence`, `memory_wiki_why_believe`, `memory_wiki_explain_recall`;
+- context: `memory_wiki_pack_context`, `memory_wiki_recall_plan`, `memory_wiki_memory_diff`;
+- preference priority: `memory_wiki_preference_layer`, `memory_wiki_add_preference_rule`;
+- projects/tasks: `memory_wiki_add_project_profile`, `memory_wiki_get_project_context`, `memory_wiki_add_task_capsule`, `memory_wiki_post_task`;
+- graph: `memory_wiki_add_entity`, `memory_wiki_add_relation`, `memory_wiki_graph_query`;
+- quality: `memory_wiki_lint_claim`, `memory_wiki_review_queue`, `memory_wiki_curate`, `memory_wiki_vacuum`, `memory_wiki_immune_scan`, `memory_wiki_evaluate_retrieval`;
+- contradictions: `memory_wiki_contradict`, `memory_wiki_resolve_contradiction`, `memory_wiki_resolve_by_policy`;
+- operations: `memory_wiki_doctor`, `memory_wiki_health`, `memory_wiki_repair`, `memory_wiki_maintenance`, `memory_wiki_dashboard`, `memory_wiki_active_dashboard`;
+- backup/sync: `memory_wiki_backup`, `memory_wiki_restore`, `memory_wiki_snapshot`, `memory_wiki_export_bundle`, `memory_wiki_import_bundle`;
+- audit/rollback: `memory_wiki_audit_log`, `memory_wiki_recent_changes`, `memory_wiki_mutation_log`, `memory_wiki_undo_last`, `memory_wiki_transaction`;
+- secrets metadata: `memory_wiki_add_secret`, `memory_wiki_query_secrets`, `memory_wiki_scrub_secrets`, `memory_wiki_secret_quarantine`.
 
-- `memory_wiki_query`
-- `memory_wiki_pack_context`
-- `memory_wiki_recall_plan`
-- `memory_wiki_explain_recall`
-- `memory_wiki_mark_used`
-- `memory_wiki_why_believe`
+## Safety boundary
 
-### Claims, evidence and corrections
+This repo is intentionally source-only. Do not commit:
 
-- `memory_wiki_add_claim`
-- `memory_wiki_add_evidence`
-- `memory_wiki_update_claim`
-- `memory_wiki_rewrite_claim`
-- `memory_wiki_apply_user_correction`
-
-### Secrets and redaction
-
-- `memory_wiki_add_secret`
-- `memory_wiki_query_secrets`
-- `memory_wiki_migrate_secrets_from_claims`
-- `memory_wiki_scrub_secrets`
-- `memory_wiki_secret_quarantine`
-- `memory_wiki_write_firewall`
-- `memory_wiki_source_policy`
-
-### Typed operational memory
-
-- `memory_wiki_add_decision`
-- `memory_wiki_add_mistake`
-- `memory_wiki_add_project_profile`
-- `memory_wiki_get_project_context`
-- `memory_wiki_add_task_capsule`
-- `memory_wiki_post_task`
-
-### Graph memory
-
-- `memory_wiki_add_entity`
-- `memory_wiki_add_relation`
-- `memory_wiki_graph_query`
-
-### Maintenance and quality
-
-- `memory_wiki_review_queue`
-- `memory_wiki_lint_claim`
-- `memory_wiki_health`
-- `memory_wiki_evaluate_retrieval`
-- `memory_wiki_curate`
-- `memory_wiki_vacuum`
-- `memory_wiki_normalize_topics`
-- `memory_wiki_immune_scan`
-- `memory_wiki_compress_topic`
-- `memory_wiki_compile_topic`
-
-### Contradictions and merges
-
-- `memory_wiki_contradict`
-- `memory_wiki_resolve_contradiction`
-- `memory_wiki_resolve_by_policy`
-- `memory_wiki_merge_claims`
-
-### Backups, exports and recovery
-
-- `memory_wiki_doctor`
-- `memory_wiki_repair`
-- `memory_wiki_backup`
-- `memory_wiki_list_backups`
-- `memory_wiki_restore`
-- `memory_wiki_snapshot`
-- `memory_wiki_export`
-- `memory_wiki_export_bundle`
-- `memory_wiki_import_bundle`
-- `memory_wiki_audit_log`
-- `memory_wiki_mutation_log`
-- `memory_wiki_undo_last`
-- `memory_wiki_transaction`
-
-## Optional LLM context packing
-
-`memory_wiki_pack_context` can optionally call a local/OpenAI-compatible chat completions endpoint for secondary context selection.
-
-```bash
-export MEMORY_WIKI_LLM_PACK=1
-export MEMORY_WIKI_LLM_BASE_URL=http://127.0.0.1:18646/v1
-export MEMORY_WIKI_LLM_MODEL=local-model
-export MEMORY_WIKI_LLM_TIMEOUT=45
-# If the endpoint requires auth, set MEMORY_WIKI_LLM_API_KEY in your shell.
-```
-
-If `MEMORY_WIKI_LLM_PACK` is unset or false, the plugin uses deterministic/rule-based packing only.
-
-## Data and publication model
-
-- Runtime memory is local to `$HERMES_HOME/memory-wiki`.
-- Normal claims should contain compact durable facts, not raw logs.
-- Procedures belong in skills/docs; task outcomes belong in task capsules or post-task summaries.
-- Secret values belong in a secret vault/index, not normal claims.
-- Recall and export paths redact secret-like values by default.
-- Public forks should keep `.gitignore` rules that exclude local runtime data.
-
-## Development checklist
-
-Before committing plugin changes:
-
-```bash
-python3 -m py_compile __init__.py scripts/memory_wiki_cli.py scripts/smoke_test.py
-MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
-git status --short
-```
-
-For behavior changes, update all affected areas together:
-
-- plugin metadata;
-- tool schemas;
-- dispatch handlers;
-- provider/storage logic;
-- smoke tests;
-- README and operational docs.
-
-Before publishing a public snapshot, scan the export for local runtime artifacts and secret-like strings.
+- `memory_wiki.sqlite3`, WAL/SHM/journal files or backup zips;
+- `pages/`, `dashboards/`, `snapshots/`, `spool/`, `recovery/` runtime output;
+- `.env`, credentials, vault files, session logs or real user memory;
+- `__pycache__/`, `.pytest_cache/`, local build artifacts.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT. See `LICENSE`.
